@@ -17,7 +17,7 @@ DISCORD_EPOCH = 1420070400000
 RP_UPDATE_INTERVAL = 15 # Intervalo de atualização do RP em segundos
 SCRIPT_VERSION = "1.0.0" # <--- VERSÃO ATUAL (INCREMENTE NO GITHUB PARA ATUALIZAR)
 # --- Configuração de Atualização ---
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/SeuUsuario/SeuRepositorio/main/nome_do_seu_script.py"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/kouthiol/efs/main/dm_wipe.py"
 # ^^^ ATENÇÃO: SUBSTITUA ESTA URL PELA URL RAW DO SEU SCRIPT NO GITHUB
 # -----------------------------------
 
