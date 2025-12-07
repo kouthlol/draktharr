@@ -15,11 +15,82 @@ import threading
 # Variáveis de Suporte
 DISCORD_EPOCH = 1420070400000
 RP_UPDATE_INTERVAL = 15 # Intervalo de atualização do RP em segundos
-SCRIPT_VERSION = "1.0.4" # <--- VERSÃO ATUAL (INCREMENTE NO GITHUB PARA ATUALIZAR)
+SCRIPT_VERSION = "1.0.0" # <--- VERSÃO ATUAL (INCREMENTE NO GITHUB PARA ATUALIZAR)
 # --- Configuração de Atualização ---
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/kouthlol/draktharr/main/dm_wipe.py"
 # ^^^ ATENÇÃO: SUBSTITUA ESTA URL PELA URL RAW DO SEU SCRIPT NO GITHUB
 # -----------------------------------
+
+def check_for_updates():
+    """Checa a versão mais recente do script no GitHub e realiza a atualização."""
+    global SCRIPT_VERSION, GITHUB_RAW_URL
+    print(f"\n{YELLOW}[*]{RESET} Checando por atualizações... (Versão Local: {SCRIPT_VERSION})")
+    
+    try:
+        # 1. Obter o conteúdo do script online
+        response = requests.get(GITHUB_RAW_URL, timeout=10)
+        
+        if response.status_code != 200:
+            print(f"{RED}[✗]{RESET} Erro ao acessar o GitHub (Status: {response.status_code}). Pule a atualização.")
+            return
+            
+        remote_content = response.text
+        
+        # 2. Encontrar a versão remota usando Regex
+        version_match = re.search(r'SCRIPT_VERSION = "(\d+\.\d+\.\d+)"', remote_content)
+        
+        if not version_match:
+            print(f"{RED}[✗]{RESET} Não foi possível encontrar a versão no script remoto. Pule a atualização.")
+            return
+
+        remote_version = version_match.group(1)
+        
+        # 3. Comparar
+        # Usamos tuples de inteiros para comparação correta de versões (e.g., 1.10.0 > 1.9.0)
+        local_version_tuple = tuple(map(int, SCRIPT_VERSION.split('.')))
+        remote_version_tuple = tuple(map(int, remote_version.split('.')))
+
+        if remote_version_tuple > local_version_tuple:
+            print(f"\n{GREEN}╔══════════════════════════════════════════════════════════════╗{RESET}")
+            print(f"{GREEN}║{RESET}  {BOLD}NOVA ATUALIZAÇÃO DISPONÍVEL!{RESET}")
+            print(f"{GREEN}║{RESET}  Local: {SCRIPT_VERSION} -> Remota: {remote_version}")
+            print(f"{GREEN}╚══════════════════════════════════════════════════════════════╝{RESET}")
+            
+            confirm = safe_input(f"{YELLOW}Deseja atualizar agora? (s/n):{RESET} ").lower()
+            
+            if confirm == 's':
+                # 4. Baixar e Substituir
+                current_script_name = os.path.basename(sys.argv[0])
+                
+                print(f"{CYAN}[*]{RESET} Fazendo backup e baixando nova versão...")
+                # Salva o arquivo atual com um backup rápido
+                try:
+                    shutil.copy(current_script_name, f"{current_script_name}.bak")
+                except Exception as e:
+                    print(f"{RED}[✗]{RESET} Aviso: Não foi possível criar arquivo de backup. {e}")
+
+                with open(current_script_name, 'w', encoding='utf-8') as f:
+                    f.write(remote_content)
+                    
+                print(f"{GREEN}[✓]{RESET} Atualização concluída para a versão {remote_version}!")
+                print(f"{CYAN}[*]{RESET} O script será reiniciado para aplicar a atualização.")
+                time.sleep(3)
+                
+                # Reinicia o script
+                os.execv(sys.executable, ['python'] + sys.argv)
+                
+            else:
+                print(f"{YELLOW}[!]{RESET} Atualização cancelada pelo usuário.")
+                time.sleep(1)
+
+        elif remote_version == SCRIPT_VERSION:
+            print(f"{GREEN}[✓]{RESET} Você já está na versão mais recente ({SCRIPT_VERSION}).")
+        
+    except requests.exceptions.RequestException as e:
+        print(f"{RED}[✗]{RESET} Erro de rede ao checar atualização. Certifique-se de ter internet: {e}")
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro inesperado durante o processo de atualização: {e}")
+
 
 def snowflake_to_datetime(snowflake_id):
     """Converte um ID Snowflake do Discord para um objeto datetime."""
@@ -2470,6 +2541,11 @@ def main_menu():
     """Menu principal do script."""
     global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS, GLOBAL_RP_TOKEN_DATA
     tokens_list = load_tokens()
+    
+    # --- CHAMADA DA FUNÇÃO DE ATUALIZAÇÃO ---
+    check_for_updates() # <--- AGORA ESTÁ AQUI
+    # ---------------------------------------
+    
     start_rich_presence() # Inicia o RP e o thread de atualização
 
     while True:
@@ -2500,7 +2576,7 @@ def main_menu():
         print(f"{PURPLE}[ 8 ]{RESET} Configurar Cores do Console")
         print(f"{PURPLE}[ 9 ]{RESET} Gerenciar Estética do Perfil (Nome, Avatar, Bio)")
         print(f"{PURPLE}[ 10 ]{RESET} {BOLD}Farm Inteligente Bot Kosame (Auto Cooldown){RESET}")
-        print(f"{PURPLE}[ 11 ]{RESET} {BOLD}Limpar Pasta de Dados do Discord (WIPE){RESET}") # <--- NOVO ITEM
+        print(f"{PURPLE}[ 11 ]{RESET} {BOLD}Limpar Pasta de Dados do Discord (WIPE){RESET}")
 
         print(f"{RED}[ 0 ]{RESET} Sair\n")
 
@@ -2527,7 +2603,7 @@ def main_menu():
             elif choice == 8:
                 configure_colors_menu()
             elif choice == 11:
-                cleanup_discord_data_folder() # <--- CHAMADA DA NOVA FUNÇÃO
+                cleanup_discord_data_folder()
                 
             # Opções que PRECISAM de seleção de token
             elif choice in [2, 3, 4, 6, 9, 10]:
