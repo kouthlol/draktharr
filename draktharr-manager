@@ -10,12 +10,12 @@ from collections import defaultdict
 import datetime
 import shutil
 import glob
-import threading 
+import threading
 
 # Variáveis de Suporte
 DISCORD_EPOCH = 1420070400000
 RP_UPDATE_INTERVAL = 15 # Intervalo de atualização do RP em segundos
-SCRIPT_VERSION = "1.0.3" # <--- VERSÃO ATUAL (INCREMENTE NO GITHUB PARA ATUALIZAR)
+SCRIPT_VERSION = "1.0.4" # <--- VERSÃO ATUAL (INCREMENTE NO GITHUB PARA ATUALIZAR)
 # --- Configuração de Atualização ---
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/kouthlol/draktharr/main/dm_wipe.py"
 # ^^^ ATENÇÃO: SUBSTITUA ESTA URL PELA URL RAW DO SEU SCRIPT NO GITHUB
@@ -772,7 +772,7 @@ def get_messages(channel_id, token, user_id, limit=None):
                 # Atualiza a barra de progresso
                 if len(messages_list) > progress_bar.total:
                     # Aumenta o total estimado
-                    progress_bar.total = len(messages_list) + 100  
+                    progress_bar.total = len(messages_list) + 100 
                 progress_bar.set(len(messages_list))
 
                 if len(messages) < 100 or (limit and len(messages_list) >= limit):
@@ -1625,7 +1625,7 @@ def kosame_farm_menu(token_data):
                     
                     # Comandos de longo prazo (diário, semanal) só são reportados uma vez
                     if cooldown > MIN_CHECK_INTERVAL:
-                         print(f"{CYAN}[* Cooldown]{RESET} {cmd} disponível em: {datetime.timedelta(seconds=int(time_remaining))}")
+                          print(f"{CYAN}[* Cooldown]{RESET} {cmd} disponível em: {datetime.timedelta(seconds=int(time_remaining))}")
             
             # --- FIM DO CICLO DE ENVIO ---
             
@@ -2363,6 +2363,109 @@ def configure_colors_menu():
     # Força a atualização do RP após a operação
     update_rich_presence()
 
+# --- NOVO RECURSO: LIMPEZA DE PASTA DE DADOS DO DISCORD ---
+
+def cleanup_discord_data_folder():
+    """
+    Limpa (apaga) todo o conteúdo de uma pasta de dados do Discord (como o Data Package).
+    """
+    global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS
+    
+    original_state = GLOBAL_RP_STATE
+    original_details = GLOBAL_RP_DETAILS
+    
+    clear()
+    print_banner()
+    print_centered_bar("LIMPEZA DE PASTA DE DADOS DISCORD")
+
+    print(f"{YELLOW}[!] ATENÇÃO:{RESET} Esta função APAGARÁ PERMANENTEMENTE todos os arquivos e subpastas")
+    print(f"{YELLOW}[!] dentro do diretório que você especificar. Use com cautela!{RESET}\n")
+
+    folder_path = safe_input(f"{YELLOW}Cole o caminho COMPLETO da pasta que deseja limpar:{RESET} ").strip()
+
+    if not folder_path:
+        print(f"{YELLOW}[!]{RESET} Caminho vazio. Operação cancelada.")
+        time.sleep(1)
+        return
+
+    # Normaliza o caminho para garantir compatibilidade entre sistemas
+    folder_path = os.path.abspath(folder_path)
+
+    if not os.path.exists(folder_path):
+        print(f"{RED}[✗]{RESET} O diretório '{folder_path}' não existe.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    if not os.path.isdir(folder_path):
+        print(f"{RED}[✗]{RESET} O caminho especificado não é um diretório.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    # Contagem de itens para confirmação
+    try:
+        # Exclui '.' e '..' para contagem precisa
+        total_items = len(os.listdir(folder_path))
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro ao listar o conteúdo do diretório: {e}")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    if total_items == 0:
+        print(f"{GREEN}[✓]{RESET} A pasta já está vazia. Nenhuma ação necessária.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    print(f"\n{YELLOW}Diretório Selecionado:{RESET} {folder_path}")
+    print(f"{YELLOW}Conteúdo a ser Apagado:{RESET} {total_items} itens (arquivos e subpastas).")
+
+    confirm = safe_input(f"{RED}CONFIRMAR: APAGAR permanentemente todo o conteúdo desta pasta? (s/n):{RESET} ").lower()
+
+    if confirm != 's':
+        print(f"{CYAN}[!] Operação de limpeza cancelada pelo usuário.{RESET}")
+        time.sleep(1)
+        return
+
+    # Inicia a operação e atualiza o RP
+    GLOBAL_RP_STATE = "Limpeza de Arquivos"
+    GLOBAL_RP_DETAILS = f"Limpando pasta: {os.path.basename(folder_path)}"
+    update_rich_presence()
+    
+    deleted_count = 0
+    
+    # Processa subpastas e arquivos individualmente
+    items_to_delete = glob.glob(os.path.join(folder_path, '*'))
+    
+    progress_bar = ProgressBar(len(items_to_delete), desc="Apagando itens", bar_length=30)
+    
+    for i, item in enumerate(items_to_delete):
+        try:
+            if os.path.isdir(item):
+                shutil.rmtree(item)
+                deleted_count += 1
+            else:
+                os.remove(item)
+                deleted_count += 1
+        except Exception as e:
+            print(f"\n{RED}[✗]{RESET} Falha ao apagar {item}: {e}")
+        
+        progress_bar.update(1)
+
+    progress_bar.close()
+
+    if deleted_count == total_items:
+        print(f"\n{GREEN}[✓]{RESET} Limpeza concluída! Total de {deleted_count} itens apagados de '{os.path.basename(folder_path)}'.")
+    else:
+        print(f"\n{YELLOW}[!] Limpeza concluída. {deleted_count} itens apagados. {total_items - deleted_count} itens falharam (permissão?).")
+
+    # Restaura o estado original do RP
+    GLOBAL_RP_STATE = original_state
+    GLOBAL_RP_DETAILS = original_details
+    update_rich_presence()
+
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+# --- FIM DO NOVO RECURSO ---
+
 def main_menu():
     """Menu principal do script."""
     global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS, GLOBAL_RP_TOKEN_DATA
@@ -2384,7 +2487,7 @@ def main_menu():
         print(f"Tokens Salvos: {len(tokens_list)}\n")
 
         print(f"{CYAN}╔══════════════════════════════════════════════════════════════╗{RESET}")
-        print(f"{CYAN}║{RESET}  {BOLD}MENU PRINCIPAL{RESET}                                            {CYAN}║{RESET}")
+        print(f"{CYAN}║{RESET}  {BOLD}MENU PRINCIPAL{RESET}                                      {CYAN}║{RESET}")
         print(f"{CYAN}╚══════════════════════════════════════════════════════════════╝{RESET}\n")
 
         print(f"{PURPLE}[ 1 ]{RESET} Gerenciar Tokens")
@@ -2396,7 +2499,8 @@ def main_menu():
         print(f"{PURPLE}[ 7 ]{RESET} Rich Presence (Configurar/Status)")
         print(f"{PURPLE}[ 8 ]{RESET} Configurar Cores do Console")
         print(f"{PURPLE}[ 9 ]{RESET} Gerenciar Estética do Perfil (Nome, Avatar, Bio)")
-        print(f"{PURPLE}[ 10 ]{RESET} {BOLD}Farm Inteligente Bot Kosame (Auto Cooldown){RESET}") # NOVO
+        print(f"{PURPLE}[ 10 ]{RESET} {BOLD}Farm Inteligente Bot Kosame (Auto Cooldown){RESET}")
+        print(f"{PURPLE}[ 11 ]{RESET} {BOLD}Limpar Pasta de Dados do Discord (WIPE){RESET}") # <--- NOVO ITEM
 
         print(f"{RED}[ 0 ]{RESET} Sair\n")
 
@@ -2422,7 +2526,9 @@ def main_menu():
                 rich_presence_menu()
             elif choice == 8:
                 configure_colors_menu()
-            
+            elif choice == 11:
+                cleanup_discord_data_folder() # <--- CHAMADA DA NOVA FUNÇÃO
+                
             # Opções que PRECISAM de seleção de token
             elif choice in [2, 3, 4, 6, 9, 10]:
                 token_data = select_token()
@@ -2441,7 +2547,7 @@ def main_menu():
                     elif choice == 9:
                         manage_profile_aesthetics(token_data)
                     elif choice == 10:
-                        kosame_farm_menu(token_data) # NOVA FUNÇÃO DE FARM
+                        kosame_farm_menu(token_data)
                     GLOBAL_RP_TOKEN_DATA = None # Limpa após a conclusão
 
             elif choice == 0:
