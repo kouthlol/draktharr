@@ -1,0 +1,2473 @@
+import requests
+import time
+import os
+import json
+import sys
+import re
+import random
+import base64
+from collections import defaultdict
+import datetime
+import shutil
+import glob
+import threading 
+
+# Variáveis de Suporte
+DISCORD_EPOCH = 1420070400000
+RP_UPDATE_INTERVAL = 15 # Intervalo de atualização do RP em segundos
+SCRIPT_VERSION = "1.0.0" # <--- VERSÃO ATUAL (INCREMENTE NO GITHUB PARA ATUALIZAR)
+# --- Configuração de Atualização ---
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/SeuUsuario/SeuRepositorio/main/nome_do_seu_script.py"
+# ^^^ ATENÇÃO: SUBSTITUA ESTA URL PELA URL RAW DO SEU SCRIPT NO GITHUB
+# -----------------------------------
+
+def snowflake_to_datetime(snowflake_id):
+    """Converte um ID Snowflake do Discord para um objeto datetime."""
+    if not snowflake_id:
+        return datetime.datetime.min
+    try:
+        timestamp_ms = (int(snowflake_id) >> 22) + DISCORD_EPOCH
+        timestamp_s = timestamp_ms / 1000
+        return datetime.datetime.fromtimestamp(timestamp_s)
+    except:
+        return datetime.datetime.min
+
+# --- Definição e Importação da Presença (pypresence) ---
+class DummyPresence:
+    """Classe dummy para evitar que o código quebre se pypresence não estiver instalado."""
+    def __init__(self, client_id):
+        pass
+    def connect(self):
+        global RPC
+        RPC = None
+    def update(self, **kwargs):
+        pass
+    def close(self):
+        pass
+
+RPC = None
+RP_THREAD = None # Variável global para o thread
+RP_RUNNING_FLAG = False # Flag para controlar o loop do thread
+
+try:
+    from pypresence import Presence
+except ImportError:
+    Presence = DummyPresence
+    pass
+
+# --- Configurações de Ambiente ---
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except:
+        pass
+
+def safe_input(prompt=""):
+    """Input seguro que lida com stdin ausente e atualiza o timer de RP."""
+    global GLOBAL_LAST_INPUT_TIME
+    try:
+        result = input(prompt).replace('\n', '').replace('\r', '')
+        GLOBAL_LAST_INPUT_TIME = time.time()
+        return result
+    except (EOFError, OSError, RuntimeError) as e:
+        print(f"\n{RED}[ERRO]{RESET} Não foi possível ler entrada: {e}")
+        print(f"{RED}[!] Execute o script em um terminal/console apropriado{RESET}")
+        print(f"{RED}[!] Não execute clicando duas vezes no arquivo{RESET}")
+        print(f"\nPressione Ctrl+C para sair{RESET}")
+        time.sleep(5)
+        sys.exit(1)
+
+# --- Arquivos e Configurações ---
+TOKENS_FILE = "tokens.json"
+RICH_PRESENCE_CONFIG_FILE = "rich_presence_config.json"
+DELAY_CONFIG_FILE = "delay_config.json"
+COLORS_CONFIG_FILE = "colors_config.json"
+PROXY_CONFIG_FILE = "proxy_config.json"
+KOSAME_FARM_DATA_FILE = "kosame_farm_data.json" # NOVO: Arquivo de controle do Kosame
+
+# Configurações Rich Presence
+RICH_PRESENCE_CLIENT_ID = '1445515399218204815'
+
+RICH_PRESENCE_DEFAULTS = {
+    'details': 'Gerenciando Minha Conta Discord',
+    'state': 'Aguardando ação no menu...',
+    # Alterado para refletir o novo ícone
+    'large_image_name': 'draktharr_blade', 
+    'large_text': 'Gerenciador Draktharr',
+    'button_text': 'Ver Repositório',
+    'button_url': 'https://github.com/SeuUsuario',
+    'rp_active': True
+}
+
+# --- Configuração Específica do Kosame ---
+# Definir os comandos e seus cooldowns aproximados em segundos
+# work: 60s (1 minuto) | gf/fofocar: 300s (5 minutos) | daily: 24h | semanal: 7d | mensal: 30d
+KOSAME_COMMANDS = [
+    {"cmd": "k!daily", "cooldown_seconds": 86400, "description": "Recompensa Diária (24h)"},
+    {"cmd": "k!semanal", "cooldown_seconds": 604800, "description": "Recompensa Semanal (7d)"},
+    {"cmd": "k!mensal", "cooldown_seconds": 2592000, "description": "Recompensa Mensal (30d)"},
+    {"cmd": "k!work", "cooldown_seconds": 60, "description": "Trabalho (1 Minuto)"},
+    {"cmd": "k!gf", "cooldown_seconds": 300, "description": "Grind Fast (5 Minutos)"},
+    {"cmd": "k!fofocar", "cooldown_seconds": 300, "description": "Fofoca (5 Minutos)"},
+    {"cmd": "k!dep all", "cooldown_seconds": 1, "description": "Depositar Tudo (Imediato)"}
+]
+
+# Variáveis Globais Adicionais para Rich Presence e Delay
+GLOBAL_DELETED_COUNT = 0
+GLOBAL_CLEANUP_MODE = False
+GLOBAL_LAST_INPUT_TIME = time.time()
+GLOBAL_RP_STATE = "Menu Principal"
+GLOBAL_RP_DETAILS = "Gerenciando Minha Conta Discord"
+GLOBAL_RP_TOKEN_DATA = None # Armazena o token_data do token selecionado
+GLOBAL_RP_PROGRESS = None # Armazena o progresso atual para o thread
+
+# Configuração Global de Proxy
+GLOBAL_PROXY = None
+
+# Configurações Globais de Delay
+GLOBAL_DELAY_BASE_SECONDS = 1.0
+GLOBAL_DELAY_MAX_DEVIATION = 0.5
+
+DELAY_DEFAULTS = {
+    'base_delay': 1.0,
+    'max_deviation': 0.5
+}
+
+DELAY_PROFILES = {
+    1: {'name': 'Modo Seguro (Baixo Risco)', 'base': 2.5, 'dev': 0.5, 'desc': 'Segurança máxima entre requisições.'},
+    2: {'name': 'Modo Equilíbrio (Médio Risco)', 'base': 1.0, 'dev': 0.5, 'desc': 'Padrão: Bom equilíbrio entre velocidade e segurança.'},
+    3: {'name': 'Modo Agressivo (Alto Risco)', 'base': 0.5, 'dev': 0.2, 'desc': 'Velocidade máxima, alto risco de Rate Limit.'},
+    4: {'name': 'Modo Personalizado', 'base': None, 'dev': None, 'desc': 'Ajuste manual dos valores.'}
+}
+
+# --- Configurações de Requisições e Cores (ANSI PADRÃO) ---
+headers_template = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Referer': 'https://discord.com/channels/@me'
+}
+
+# Definições Padrão de Cores (ANSI)
+RESET = '\033[0m'
+PURPLE = '\033[95m'
+CYAN = '\033[96m'
+GREEN = '\033[92m'
+YELLOW = '\033[93m'
+RED = '\033[91m'
+BOLD = '\033[1m'
+WHITE = '\033[97m'
+
+COLORS_DEFAULTS = {
+    'RESET': '\033[0m',
+    'PURPLE': '\033[95m',
+    'CYAN': '\033[96m',
+    'GREEN': '\033[92m',
+    'YELLOW': '\033[93m',
+    'RED': '\033[91m',
+    'BOLD': '\033[1m',
+    'WHITE': '\033[97m'
+}
+
+# Paleta de Cores Ampliada
+ANSI_PALETTE = {
+    1: {'name': 'VERMELHO BRILHANTE', 'code': '\033[91m', 'exemplo': '\033[91m'},
+    2: {'name': 'VERDE BRILHANTE', 'code': '\033[92m', 'exemplo': '\033[92m'},
+    3: {'name': 'AMARELO BRILHANTE', 'code': '\033[93m', 'exemplo': '\033[93m'},
+    4: {'name': 'AZUL BRILHANTE', 'code': '\033[94m', 'exemplo': '\033[94m'},
+    5: {'name': 'ROXO/MAGENTA BRILHANTE', 'code': '\033[95m', 'exemplo': '\033[95m'},
+    6: {'name': 'CIANO BRILHANTE', 'code': '\033[96m', 'exemplo': '\033[96m'},
+    7: {'name': 'BRANCO BRILHANTE', 'code': '\033[97m', 'exemplo': '\033[97m'},
+    8: {'name': 'PRETO (Fundo Padrão)', 'code': '\033[30m', 'exemplo': '\033[30m'},
+    9: {'name': 'CINZA ESCURO', 'code': '\033[90m', 'exemplo': '\033[90m'},
+    10: {'name': 'AZUL CLARO', 'code': '\033[36m', 'exemplo': '\033[36m'},
+    11: {'name': 'AMARELO ESCURO', 'code': '\033[33m', 'exemplo': '\033[33m'},
+    12: {'name': 'PADRÃO (Branco/Cinza)', 'code': '\033[37m', 'exemplo': '\033[37m'},
+    21: {'name': 'FUNDO VERMELHO', 'code': '\033[41m', 'exemplo': '\033[41m'},
+    22: {'name': 'FUNDO VERDE', 'code': '\033[42m', 'exemplo': '\033[42m'},
+    23: {'name': 'FUNDO AMARELO', 'code': '\033[43m', 'exemplo': '\033[43m'},
+    24: {'name': 'FUNDO AZUL', 'code': '\033[44m', 'exemplo': '\033[44m'},
+    25: {'name': 'FUNDO ROXO', 'code': '\033[45m', 'exemplo': '\033[45m'},
+    26: {'name': 'FUNDO CIANO', 'code': '\033[46m', 'exemplo': '\033[46m'},
+    27: {'name': 'FUNDO BRANCO', 'code': '\033[47m', 'exemplo': '\033[47m'},
+}
+
+# Classe de Barra de Progresso
+class ProgressBar:
+    """Barra de progresso customizada com estilo ANSI."""
+
+    def __init__(self, total, desc="Progresso", bar_length=40, show_percentage=True, show_count=True):
+        self.total = total
+        self.current = 0
+        self.desc = desc
+        self.bar_length = bar_length
+        self.show_percentage = show_percentage
+        self.show_count = show_count
+        self.start_time = time.time()
+
+    def update(self, n=1):
+        """Atualiza o progresso em n unidades."""
+        self.current += n
+        self._render()
+
+    def set(self, value):
+        """Define o progresso para um valor específico."""
+        self.current = value
+        self._render()
+
+    def _render(self):
+        """Renderiza a barra de progresso."""
+        global GLOBAL_RP_PROGRESS
+
+        if self.total == 0:
+            percentage = 100
+            filled = self.bar_length
+        else:
+            percentage = min(100, (self.current / self.total) * 100)
+            filled = int(self.bar_length * self.current / self.total)
+
+        # Atualiza o progresso global para o thread de RP
+        GLOBAL_RP_PROGRESS = f"[{self.current}/{self.total}] ({percentage:.2f}%)"
+
+        bar = '█' * filled + '░' * (self.bar_length - filled)
+
+        line_parts = ["{}{}:{}".format(CYAN, self.desc, RESET)]
+
+        if self.show_percentage:
+            line_parts.append("{}{:>6.2f}%{}".format(GREEN, percentage, RESET))
+
+        line_parts.append("{}[{}]{}".format(PURPLE, bar, RESET))
+
+        if self.show_count:
+            line_parts.append("{}{}/{} {}".format(YELLOW, self.current, self.total, RESET))
+
+        elapsed = time.time() - self.start_time
+        if self.current > 0 and self.current < self.total:
+            rate = self.current / elapsed
+            remaining = (self.total - self.current) / rate
+            eta = "ETA: {}s".format(int(remaining))
+        elif self.current >= self.total:
+            eta = "Concluído em {}s".format(int(elapsed))
+        else:
+            eta = "Calculando..."
+
+        line_parts.append("{}{}{}".format(WHITE, eta, RESET))
+
+        line = " ".join(line_parts)
+        terminal_width = shutil.get_terminal_size((80, 20)).columns
+        print(f"\r{line:<{terminal_width}}", end='', flush=True)
+
+        if self.current >= self.total:
+            pass
+
+    def close(self):
+        """Finaliza a barra de progresso."""
+        global GLOBAL_RP_PROGRESS
+        if self.current < self.total:
+            self.current = self.total
+            self._render()
+        print()
+        GLOBAL_RP_PROGRESS = None # Limpa o progresso ao fechar
+
+# Função de Verificação de Tokens em Massa
+def check_all_tokens_status(tokens_list):
+    """Verifica o status (ativo/revogado) de todos os tokens salvos."""
+    if not tokens_list:
+        print(f"{YELLOW}[!]{RESET} Nenhum token salvo para verificar.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    clear()
+    print_banner()
+    print_centered_bar("VERIFICADOR DE TOKENS EM MASSA")
+
+    print(f"{YELLOW}[*]{RESET} Iniciando verificação de {len(tokens_list)} tokens. Aguarde...\n")
+
+    active_count = 0
+    revoked_count = 0
+
+    headers_check = headers_template.copy()
+    url_check = 'https://discord.com/api/v10/users/@me'
+
+    progress_bar = ProgressBar(len(tokens_list), desc="Verificando tokens", bar_length=30)
+
+    results = []
+
+    for i, token_data in enumerate(tokens_list):
+        token = token_data['token']
+        username = token_data.get('username', 'Usuário Desconhecido')
+        discriminator = token_data.get('discriminator', '0')
+        if discriminator == '0':
+            display_name = username
+        else:
+            display_name = f"{username}#{discriminator}"
+
+        headers_check['Authorization'] = token
+        headers_check['User-Agent'] = headers_template['User-Agent']
+        headers_check['Referer'] = headers_template['Referer']
+
+        try:
+            response = requests.get(url_check, headers=headers_check, timeout=5, proxies=GLOBAL_PROXY)
+
+            if response.status_code == 200:
+                active_count += 1
+                results.append((display_name, token[:10], "ATIVO", GREEN))
+            elif response.status_code == 401:
+                revoked_count += 1
+                results.append((display_name, token[:10], "REVOGADO", RED))
+            else:
+                results.append((display_name, token[:10], f"ERRO ({response.status_code})", YELLOW))
+
+        except requests.exceptions.RequestException as e:
+            results.append((display_name, token[:10], "ERRO DE REDE", RED))
+
+        progress_bar.update(1)
+        apply_delay()
+
+    progress_bar.close()
+
+    print(f"\n{CYAN}{'─' * 70}{RESET}")
+    print(f"{BOLD}RESULTADOS DA VERIFICAÇÃO:{RESET}\n")
+
+    for username, token_snippet, status, color in results:
+        print(f"{color}[{status}]{RESET} {username} ({token_snippet}...)")
+
+    print(f"\n{CYAN}{'─' * 70}{RESET}")
+    print(f"{GREEN}✓ Ativos:{RESET} {active_count} | {RED}✗ Revogados:{RESET} {revoked_count} | Total: {len(tokens_list)}")
+
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+# Funções de Cores Persistentes
+def load_colors_config():
+    """Carrega as configurações de cores salvas e atualiza as globais."""
+    global RESET, PURPLE, CYAN, GREEN, YELLOW, RED, BOLD, WHITE
+
+    config = COLORS_DEFAULTS.copy()
+    try:
+        if os.path.exists(COLORS_CONFIG_FILE):
+            with open(COLORS_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                saved_config = json.load(f)
+            config.update(saved_config)
+
+        RESET = config.get('RESET', COLORS_DEFAULTS['RESET'])
+        PURPLE = config.get('PURPLE', COLORS_DEFAULTS['PURPLE'])
+        CYAN = config.get('CYAN', COLORS_DEFAULTS['CYAN'])
+        GREEN = config.get('GREEN', COLORS_DEFAULTS['GREEN'])
+        YELLOW = config.get('YELLOW', COLORS_DEFAULTS['YELLOW'])
+        RED = config.get('RED', COLORS_DEFAULTS['RED'])
+        BOLD = config.get('BOLD', COLORS_DEFAULTS['BOLD'])
+        WHITE = config.get('WHITE', COLORS_DEFAULTS['WHITE'])
+
+    except Exception as e:
+        for key, value in COLORS_DEFAULTS.items():
+            globals()[key] = value
+
+load_colors_config()
+
+def save_colors_config(config_to_save):
+    """Salva a configuração de cores atual."""
+    try:
+        with open(COLORS_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config_to_save, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro ao salvar configuração de cores: {e}")
+        return False
+
+# Funções de Delay Persistente
+def load_delay_config():
+    """Carrega as configurações de delay salvas ou usa o padrão."""
+    global GLOBAL_DELAY_BASE_SECONDS, GLOBAL_DELAY_MAX_DEVIATION
+
+    config = DELAY_DEFAULTS.copy()
+    try:
+        if os.path.exists(DELAY_CONFIG_FILE):
+            with open(DELAY_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                saved_config = json.load(f)
+            config.update(saved_config)
+
+            base = float(config.get('base_delay', 1.0))
+            dev = float(config.get('max_deviation', 0.5))
+
+            if base > 0 and dev >= 0 and dev < base:
+                GLOBAL_DELAY_BASE_SECONDS = base
+                GLOBAL_DELAY_MAX_DEVIATION = dev
+            else:
+                GLOBAL_DELAY_BASE_SECONDS = 1.0
+                GLOBAL_DELAY_MAX_DEVIATION = 0.5
+
+    except Exception:
+        GLOBAL_DELAY_BASE_SECONDS = 1.0
+        GLOBAL_DELAY_MAX_DEVIATION = 0.5
+
+    return config
+
+def save_delay_config():
+    """Salva a configuração de delay atual nos globais."""
+    try:
+        config = {
+            'base_delay': GLOBAL_DELAY_BASE_SECONDS,
+            'max_deviation': GLOBAL_DELAY_MAX_DEVIATION
+        }
+        with open(DELAY_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro ao salvar configuração de delay: {e}")
+        return False
+
+load_delay_config()
+
+# Funções de Proxy
+def load_proxy_config():
+    """Carrega a configuração de proxy do arquivo."""
+    global GLOBAL_PROXY
+
+    if not os.path.exists(PROXY_CONFIG_FILE):
+        GLOBAL_PROXY = None
+        return
+
+    try:
+        with open(PROXY_CONFIG_FILE, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+
+        proxy_url = config.get('proxy_url')
+        if proxy_url:
+            GLOBAL_PROXY = {
+                "http": proxy_url,
+                "https": proxy_url,
+            }
+        else:
+            GLOBAL_PROXY = None
+
+    except Exception:
+        GLOBAL_PROXY = None
+
+def save_proxy_config(proxy_url):
+    """Salva a configuração de proxy no arquivo."""
+    try:
+        config = {'proxy_url': proxy_url}
+        with open(PROXY_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        load_proxy_config()
+        return True
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro ao salvar configuração de proxy: {e}")
+        return False
+
+def configure_proxy_menu():
+    """Menu para configurar o proxy global."""
+    clear()
+    print_banner()
+    print_centered_bar("CONFIGURAÇÃO DE PROXY (Furtividade)")
+
+    load_proxy_config()
+    status = f"{GREEN}ATIVO ({GLOBAL_PROXY['http']}){RESET}" if GLOBAL_PROXY else f"{YELLOW}INATIVO{RESET}"
+
+    print(f"Status Atual: {status}\n")
+
+    print(f"{PURPLE}[ 1 ]{RESET} Definir/Atualizar Proxy (Ex: http://user:pass@ip:port)")
+    print(f"{PURPLE}[ 2 ]{RESET} Desativar Proxy")
+    print(f"{RED}[ 0 ]{RESET} Voltar")
+
+    try:
+        choice = safe_input(f"\n{GREEN}>{RESET} ").strip()
+        if choice == '1':
+            proxy_url = safe_input(f"{YELLOW}Cole a URL completa do Proxy:{RESET} ").strip()
+            if save_proxy_config(proxy_url):
+                print(f"{GREEN}[✓]{RESET} Proxy definido e ativado.")
+            time.sleep(1)
+        elif choice == '2':
+            if save_proxy_config(None):
+                print(f"{GREEN}[✓]{RESET} Proxy desativado.")
+            time.sleep(1)
+
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro: {e}")
+        time.sleep(1)
+
+load_proxy_config()
+
+# Funções de Controle de Agendamento (Kosame)
+def load_kosame_farm_data(user_id):
+    """Carrega o registro de última execução dos comandos para um user_id."""
+    data = {}
+    try:
+        if os.path.exists(KOSAME_FARM_DATA_FILE):
+            with open(KOSAME_FARM_DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+    except:
+        pass
+    # Retorna o registro específico para o token
+    return data.get(user_id, {})
+
+def save_kosame_farm_data(user_id, farm_data):
+    """Salva o registro de última execução dos comandos para um user_id."""
+    all_data = {}
+    try:
+        if os.path.exists(KOSAME_FARM_DATA_FILE):
+            with open(KOSAME_FARM_DATA_FILE, 'r', encoding='utf-8') as f:
+                all_data = json.load(f)
+    except:
+        pass
+    
+    all_data[user_id] = farm_data
+    
+    try:
+        with open(KOSAME_FARM_DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(all_data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro ao salvar dados de farm: {e}")
+
+# Funções utilitárias
+def clear():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def print_banner():
+    banner = f"""
+{PURPLE}      ██████╗ ██████╗  █████╗ ██╗  ██╗████████╗██╗  ██╗ █████╗ ██████╗ ██████╗
+      ██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝╚══██╔══╝██║  ██║██╔══██╗██╔══██╗██╔══██╗
+      ██║  ██║██████╔╝███████║█████╔╝     ██║   ███████║███████║██████╔╝██████╔╝
+      ██║  ██║██╔══██╗██╔══██║██╔═██╗     ██║   ██╔══██║██╔══██║██╔══██╗██╔══██╗
+      ██████╔╝██║  ██║██║  ██║██║  ██╗    ██║   ██║  ██║██║  ██║██║  ██║██║  ██║
+      ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝    ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝{RESET}
+"""
+    print(banner)
+
+def print_centered_bar(title, bar_width=62):
+    raw_title = title
+    clean_title = re.sub(r'\x1b\[[0-9;]*m', '', raw_title)
+    padding = (bar_width - len(clean_title)) // 2
+    r_padding = bar_width - len(clean_title) - padding
+
+    print(f"{CYAN}╔{('═' * bar_width)}╗{RESET}")
+    print(f"{CYAN}║{RESET}{' ' * padding}{BOLD}{title}{RESET}{' ' * r_padding}{CYAN}║{RESET}")
+    print(f"{CYAN}╚{('═' * bar_width)}╝{RESET}")
+
+# Funções de Tokens e Informações
+def load_tokens():
+    """Carrega tokens do arquivo."""
+    try:
+        if os.path.exists(TOKENS_FILE):
+            with open(TOKENS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"{YELLOW}[!]{RESET} Erro ao carregar tokens: {e}")
+    return []
+
+def save_tokens(tokens):
+    """Salva tokens no arquivo."""
+    try:
+        with open(TOKENS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tokens, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro ao salvar tokens: {e}")
+
+def get_user_info(token):
+    """Obtém informações básicas do usuário a partir do token."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    headers['Referer'] = 'https://discord.com/channels/@me'
+
+    url = 'https://discord.com/api/v10/users/@me'
+    try:
+        response = requests.get(url, headers=headers, timeout=10, proxies=GLOBAL_PROXY)
+
+        if response.status_code != 200:
+            return None
+
+        user = response.json()
+        return {
+            'id': user['id'],
+            'username': user['username'],
+            'discriminator': user.get('discriminator', '0'),
+            'token': token
+        }
+    except Exception as e:
+        return None
+
+def set_user_info(token, payload):
+    """Altera o perfil do usuário (nome, avatar, bio, etc.)."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    headers['Referer'] = 'https://discord.com/channels/@me'
+    headers['X-Context'] = '{"location":"user_settings"}'
+
+    url = 'https://discord.com/api/v10/users/@me'
+
+    apply_delay()
+
+    try:
+        response = requests.patch(url, headers=headers, json=payload, timeout=10, proxies=GLOBAL_PROXY)
+
+        if response.status_code == 200:
+            return True, response.json()
+
+        if response.status_code == 400:
+            error_details = response.json()
+            error_msg = error_details.get('message', 'Erro 400: Revisar payload.')
+
+            if 'password' in error_details.get('errors', {}):
+                error_msg = "Formato de formulário inválido | Causa provável: Senha incorreta ou ausente."
+
+            return False, {"message": error_msg}
+
+        if response.status_code == 401:
+            return False, {"message": "401 Unauthorized: Token inválido."}
+
+        if response.status_code == 429:
+            retry_after = response.json().get('retry_after', 5)
+            print(f"\n{RED}[!] Rate Limit: Esperando {retry_after:.1f} segundos...{RESET}")
+            time.sleep(retry_after)
+            return set_user_info(token, payload)
+
+        return False, response.json()
+
+    except Exception as e:
+        return False, {"message": f"Erro de rede: {e}"}
+
+def apply_delay():
+    """Aplica um atraso aleatório baseado nas configurações globais."""
+    global GLOBAL_DELAY_BASE_SECONDS, GLOBAL_DELAY_MAX_DEVIATION
+    try:
+        delay_range = GLOBAL_DELAY_MAX_DEVIATION
+        base_delay = GLOBAL_DELAY_BASE_SECONDS
+
+        min_sleep = max(0.1, base_delay - delay_range)
+        max_sleep = base_delay + delay_range
+
+        sleep_time = random.uniform(min_sleep, max_sleep)
+        time.sleep(sleep_time)
+
+    except Exception:
+        time.sleep(1.5)
+
+def send_message(channel_id, token, message):
+    """Envia uma mensagem para um canal/DM/grupo específico."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    url = f'https://discord.com/api/v10/channels/{channel_id}/messages'
+    data = {"content": message}
+
+    apply_delay()
+
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10, proxies=GLOBAL_PROXY)
+
+        if response.status_code == 200:
+            return True, None
+
+        if response.status_code == 429:
+            retry_after = response.json().get('retry_after', 5)
+            print(f"\n{RED}[!] Rate Limit: Esperando {retry_after:.1f} segundos...{RESET}")
+            time.sleep(retry_after)
+            response = requests.post(url, headers=headers, json=data, timeout=10, proxies=GLOBAL_PROXY)
+            return response.status_code == 200, response.json().get('message', f"Erro {response.status_code}")
+
+        return False, response.json().get('message', f"Erro {response.status_code}")
+
+    except Exception as e:
+        return False, str(e)
+
+# Funções de Utilitário de DM/Canal
+def get_dms(token):
+    """Obtém todos os canais de DM e Grupo do usuário."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    url = 'https://discord.com/api/v10/users/@me/channels'
+    try:
+        response = requests.get(url, headers=headers, timeout=10, proxies=GLOBAL_PROXY)
+        if response.status_code == 200:
+            return response.json()
+        return []
+    except:
+        return []
+
+def get_all_dms(token):
+    """Alias para get_dms."""
+    return get_dms(token)
+
+def close_channel(channel_id, token):
+    """Fecha (deleta) um canal DM ou Grupo DM."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    url = f'https://discord.com/api/v10/channels/{channel_id}'
+
+    apply_delay()
+
+    try:
+        response = requests.delete(url, headers=headers, timeout=10, proxies=GLOBAL_PROXY)
+        if response.status_code == 204:
+            return True
+        return False
+    except:
+        return False
+
+def get_channel_name(dm):
+    """Retorna um nome legível para o canal DM/Grupo/Servidor."""
+    if dm.get('type') == 1:
+        recipient = dm.get('recipients', [{}])[0]
+        username = recipient.get('username', 'Usuário Desconhecido')
+        discriminator = recipient.get('discriminator', '0')
+        if discriminator == '0':
+            return f"DM com @{username}"
+        return f"DM com {username}#{discriminator}"
+    elif dm.get('type') == 3:
+        return dm.get('name', 'Grupo DM Sem Nome') or 'Grupo DM Sem Nome'
+    elif dm.get('type') in [0, 2, 4, 5, 6]:
+        return f"Canal Servidor: {dm.get('name', 'N/A')}"
+    else:
+        return f"Canal ID: {dm['id']}"
+
+def get_channel_id_info(channel_id, token):
+    """Obtém informações de um canal específico (DM/Grupo)."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    url = f'https://discord.com/api/v10/channels/{channel_id}'
+    try:
+        response = requests.get(url, headers=headers, timeout=10, proxies=GLOBAL_PROXY)
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except:
+        return None
+
+def get_messages(channel_id, token, user_id, limit=None):
+    """Busca mensagens do usuário em um canal."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    url = f'https://discord.com/api/v10/channels/{channel_id}/messages'
+
+    messages_list = []
+    last_id = None
+
+    print(f"\n{YELLOW}[*]{RESET} Coletando mensagens, aguarde...")
+
+    progress_bar = ProgressBar(100, desc="Coletando mensagens", bar_length=25, show_count=False)
+
+    while True:
+        params = {'limit': 100}
+        if last_id:
+            params['before'] = last_id
+
+        try:
+            apply_delay()
+            response = requests.get(url, headers=headers, params=params, timeout=15, proxies=GLOBAL_PROXY)
+
+            if response.status_code == 200:
+                messages = response.json()
+
+                if not messages:
+                    break
+
+                if user_id:
+                    new_messages = [msg for msg in messages if msg.get('author', {}).get('id') == user_id]
+                else:
+                    new_messages = messages
+
+                messages_list.extend(new_messages)
+                last_id = messages[-1]['id']
+
+                # Atualiza a barra de progresso
+                if len(messages_list) > progress_bar.total:
+                    # Aumenta o total estimado
+                    progress_bar.total = len(messages_list) + 100  
+                progress_bar.set(len(messages_list))
+
+                if len(messages) < 100 or (limit and len(messages_list) >= limit):
+                    break
+
+            elif response.status_code == 429:
+                retry_after = response.json().get('retry_after', 5)
+                print(f"\n{RED}[!] Rate Limit durante a coleta: Esperando {retry_after:.1f}s...{RESET}")
+                time.sleep(retry_after)
+                continue
+            else:
+                print(f"\n{RED}[✗]{RESET} Erro ao buscar mensagens: {response.status_code}")
+                break
+
+        except requests.exceptions.Timeout:
+            print(f"\n{RED}[✗]{RESET} Timeout de rede durante a coleta.")
+            break
+        except Exception as e:
+            print(f"\n{RED}[✗]{RESET} Erro de rede na coleta: {e}")
+            break
+
+    # Finaliza a barra de progresso
+    progress_bar.total = len(messages_list)
+    progress_bar.set(len(messages_list))
+    progress_bar.close()
+
+    print(f"{GREEN}[✓]{RESET} Coleta concluída. Total de mensagens encontradas: {len(messages_list)}.")
+    return messages_list
+
+def delete_message(channel_id, message_id, token, token_data):
+    """Deleta uma mensagem específica."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    url = f'https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}'
+
+    apply_delay()
+
+    try:
+        response = requests.delete(url, headers=headers, timeout=10, proxies=GLOBAL_PROXY)
+
+        if response.status_code in [204, 200]:
+            return True
+
+        if response.status_code == 429:
+            retry_after = response.json().get('retry_after', 5)
+            print(f"\n{RED}[!] Rate Limit: Esperando {retry_after:.1f} segundos...{RESET}")
+            time.sleep(retry_after)
+            return delete_message(channel_id, message_id, token, token_data)
+
+        return False
+    except:
+        return False
+
+def delete_dm_messages(dm, user_id, token_data):
+    global GLOBAL_CLEANUP_MODE, GLOBAL_RP_DETAILS, GLOBAL_DELETED_COUNT, GLOBAL_RP_PROGRESS
+    token = token_data['token']
+    channel_id = dm['id']
+    channel_name = get_channel_name(dm)
+
+    my_messages = get_messages(channel_id, token, user_id)
+
+    if not my_messages:
+        print(f"{YELLOW}[!]{RESET} Nenhuma mensagem sua encontrada para apagar em '{channel_name}'.")
+        return 0
+
+    print(f"\n{CYAN}╔══════════════════════════════════════════════════════════════╗{RESET}")
+    print(f"{CYAN}║{RESET}  Conversa: {BOLD}{channel_name}{RESET} | {len(my_messages)} mensagens suas encontradas.")
+    print(f"{CYAN}╚══════════════════════════════════════════════════════════════╝{RESET}\n")
+
+    confirm_delete = safe_input(f"{RED}CONFIRMAR: Deseja APAGAR {len(my_messages)} mensagens suas nesta conversa? (s/n):{RESET} ").lower()
+
+    if confirm_delete != 's':
+        print(f"{YELLOW}[!]{RESET} Exclusão cancelada.")
+        return 0
+
+    GLOBAL_CLEANUP_MODE = True
+    GLOBAL_RP_DETAILS = channel_name
+
+    deleted = 0
+    progress_bar = ProgressBar(len(my_messages), desc="Deletando mensagens", bar_length=25)
+
+    for i, msg in enumerate(my_messages):
+        try:
+            if delete_message(channel_id, msg['id'], token, token_data):
+                deleted += 1
+                GLOBAL_DELETED_COUNT += 1
+                progress_bar.update(1)
+            else:
+                progress_bar.update(1)
+        except Exception as e:
+            progress_bar.update(1)
+            time.sleep(1)
+
+    progress_bar.close()
+
+    GLOBAL_CLEANUP_MODE = False
+    GLOBAL_RP_DETAILS = "Gerenciando Minha Conta Discord"
+
+    print(f"\n{GREEN}[✓]{RESET} {deleted} mensagens deletadas nesta DM/Grupo/Canal!\n")
+    return deleted
+
+def delete_group_by_channel_id(channel_id, user_id, token_data):
+    """Limpa mensagens de um canal por ID."""
+    token = token_data['token']
+
+    channel_info = get_channel_id_info(channel_id, token)
+
+    if not channel_info:
+        print(f"{RED}[✗]{RESET} Não foi possível encontrar informações para o ID de Canal: {channel_id} (ID inválido ou sem acesso).")
+        return
+
+    dm_object = {
+        'id': channel_id,
+        'type': channel_info.get('type'),
+        'recipients': channel_info.get('recipients'),
+        'name': channel_info.get('name')
+    }
+
+    channel_type = channel_info.get('type')
+    channel_name = get_channel_name(dm_object)
+
+    if channel_type in [1, 3]:
+        deleted_count = delete_dm_messages(dm_object, user_id, token_data)
+
+        if deleted_count > 0:
+            print(f"{GREEN}[✓]{RESET} Limpeza de DM/Grupo ({channel_name}) concluída.")
+        elif deleted_count == 0:
+            print(f"{YELLOW}[!]{RESET} Nenhuma mensagem sua encontrada para apagar neste canal.")
+
+    elif channel_type in [0, 2, 4, 5, 6]:
+        print(f"\n{YELLOW}[!]{RESET} O ID fornecido é de um **Canal de Servidor** ({channel_name}).")
+        print(f"{YELLOW}[!]{RESET} A limpeza em canais de servidor é mais arriscada e lenta.")
+        confirm_server = safe_input(f"{RED}CONFIRMAR: Deseja tentar limpar **suas mensagens** neste canal de servidor? (s/n):{RESET} ").lower()
+
+        if confirm_server == 's':
+            deleted_count = delete_dm_messages(dm_object, user_id, token_data)
+
+            if deleted_count > 0:
+                print(f"{GREEN}[✓]{RESET} Limpeza de canal de servidor concluída.")
+            elif deleted_count == 0:
+                print(f"{YELLOW}[!]{RESET} Nenhuma mensagem sua encontrada para apagar neste canal de servidor.")
+        else:
+            print(f"{YELLOW}[!]{RESET} Limpeza de canal de servidor cancelada.")
+
+    else:
+        print(f"{RED}[✗]{RESET} Tipo de canal ({channel_type}) não suportado para limpeza.")
+
+def delete_all_dms(dms, user_id, token_data):
+    """Limpa mensagens de todas as DMs/Grupos."""
+    token = token_data['token']
+    total_deleted = 0
+
+    dm_list = [dm for dm in dms if dm.get('type') in [1, 3]]
+
+    if not dm_list:
+        print(f"{YELLOW}[!]{RESET} Nenhum DM ou Grupo DM para processar.")
+        return 0
+
+    print(f"\n{CYAN}--- INICIANDO LIMPEZA EM {len(dm_list)} CANAIS ---{RESET}\n")
+
+    progress_bar = ProgressBar(len(dm_list), desc="Processando DMs/Grupos", bar_length=25, show_count=True)
+
+    for dm in dm_list:
+        channel_name = get_channel_name(dm)
+        print(f"\n{PURPLE}[*]{RESET} Processando: {channel_name}")
+
+        deleted_in_dm = delete_dm_messages(dm, user_id, token_data)
+        total_deleted += deleted_in_dm
+
+        progress_bar.update(1)
+
+        if deleted_in_dm > 0:
+            apply_delay()
+
+    progress_bar.close()
+
+    print(f"\n{GREEN}╔══════════════════════════════════════════════════════════════╗{RESET}")
+    print(f"{GREEN}║{RESET}  {BOLD}LIMPEZA EM MASSA CONCLUÍDA!{RESET}")
+    print(f"{GREEN}║{RESET}  Total de Mensagens Suas Apagadas: {BOLD}{total_deleted}{RESET}")
+    print(f"{GREEN}╚══════════════════════════════════════════════════════════════╝{RESET}")
+    return total_deleted
+
+def delete_inactive_dms(token_data):
+    """Fecha DMs/Grupos inativos há X dias."""
+    token = token_data['token']
+
+    clear()
+    print_banner()
+    print_centered_bar(f"FECHAR CONVERSAS INATIVAS - CONTA: {token_data['username']}")
+
+    try:
+        inactive_days_input = safe_input(f"{YELLOW}Fechar DMs/Grupos inativos há quantos dias? (Ex: 90){RESET} ").strip()
+        if not inactive_days_input:
+            print(f"{YELLOW}[!]{RESET} Operação cancelada por entrada vazia.")
+            time.sleep(1)
+            return
+
+        inactive_days = int(inactive_days_input)
+
+        if inactive_days < 1:
+            print(f"{RED}[✗]{RESET} O número de dias deve ser 1 ou mais.")
+            time.sleep(2)
+            return
+    except ValueError:
+        print(f"{RED}[✗]{RESET} Entrada inválida. Use um número inteiro.")
+        time.sleep(2)
+        return
+
+    confirmation = safe_input(f"{YELLOW}CONFIRMAR: Fechar conversas inativas há {inactive_days} dias? (s/n):{RESET} ").strip().lower()
+    if confirmation != 's':
+        print(f"{CYAN}[!] Operação cancelada pelo usuário.{RESET}")
+        time.sleep(1)
+        return
+
+    dm_channels = get_all_dms(token)
+    if not dm_channels:
+        print(f"{RED}[✗]{RESET} Falha ao obter a lista de DMs, ou nenhuma conversa encontrada.")
+        time.sleep(2)
+        return
+
+    current_time = datetime.datetime.now()
+    inactive_dms_to_delete = []
+
+    print(f"\n{YELLOW}[*]{RESET} Analisando conversas...\n")
+    progress_bar = ProgressBar(len(dm_channels), desc="Analisando inatividade", bar_length=25)
+
+    for dm in dm_channels:
+        if dm.get('type') not in [1, 3]:
+            progress_bar.update(1)
+            continue
+
+        last_message_id = dm.get('last_message_id')
+        channel_name = get_channel_name(dm)
+
+        last_message_date = snowflake_to_datetime(last_message_id)
+
+        if last_message_date == datetime.datetime.min:
+            progress_bar.update(1)
+            continue
+
+        time_difference = current_time - last_message_date
+
+        if time_difference.days >= inactive_days:
+            inactive_dms_to_delete.append({
+                'id': dm['id'],
+                'name': channel_name,
+                'last_message': last_message_date.strftime('%Y-%m-%d'),
+                'days_inactive': time_difference.days
+            })
+
+        progress_bar.update(1)
+
+    progress_bar.close()
+
+    if not inactive_dms_to_delete:
+        print(f"\n{GREEN}[✓]{RESET} Nenhuma DM/Grupo encontrado inativo há {inactive_days} dias ou mais.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    print(f"\n{YELLOW}[!] Encontradas {len(inactive_dms_to_delete)} conversas para fechar:{RESET}")
+    for i, dm_info in enumerate(inactive_dms_to_delete[:10]):
+        print(f"  {i+1}. {dm_info['name']} (Inativa há {dm_info['days_inactive']} dias)")
+
+    if len(inactive_dms_to_delete) > 10:
+        print(f"  ... e mais {len(inactive_dms_to_delete) - 10} conversas.")
+
+    final_confirmation = safe_input(f"\n{RED}CONFIRMAR FECHAMENTO de {len(inactive_dms_to_delete)} conversas? (s/n):{RESET} ").strip().lower()
+    if final_confirmation != 's':
+        print(f"{CYAN}[!] Operação de fechamento cancelada.{RESET}")
+        time.sleep(1)
+        return
+
+    closed_count = 0
+    print()
+    progress_bar = ProgressBar(len(inactive_dms_to_delete), desc="Fechando conversas", bar_length=25)
+
+    for dm in inactive_dms_to_delete:
+        channel_id = dm['id']
+
+        if close_channel(channel_id, token):
+            closed_count += 1
+
+        progress_bar.update(1)
+        apply_delay()
+
+    progress_bar.close()
+
+    print(f"\n{CYAN}--- RESUMO ---{RESET}")
+    print(f"Total de conversas inativas encontradas: {len(inactive_dms_to_delete)}")
+    print(f"Total de conversas fechadas com sucesso: {closed_count}")
+
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+def cleanup_menu(token_data):
+    """Sub-menu para Limpeza de Mensagens."""
+    while True:
+        clear()
+        print_banner()
+        print_centered_bar(f"LIMPEZA DE MENSAGENS - CONTA: {token_data['username']}")
+
+        print(f"{PURPLE}[ 1 ]{RESET} Apagar mensagens de uma conversa DM/Grupo/Canal específica (por ID)")
+        print(f"{PURPLE}[ 2 ]{RESET} Apagar mensagens de TODAS as conversas DM/Grupo")
+        print(f"{PURPLE}[ 3 ]{RESET} {BOLD}FECHAR DMs/Grupos INATIVOS (Organização){RESET}")
+        print(f"{RED}[ 0 ]{RESET} Voltar")
+
+        try:
+            cleanup_choice_str = safe_input(f"\n{GREEN}>{RESET} ").strip()
+            if not cleanup_choice_str: continue
+            cleanup_choice = int(cleanup_choice_str)
+        except ValueError:
+            print(f"{RED}[✗]{RESET} Entrada inválida. Use um número inteiro.")
+            time.sleep(1)
+            continue
+
+        user_id = token_data['id']
+        global GLOBAL_DELETED_COUNT
+
+        if cleanup_choice == 0:
+            break
+        elif cleanup_choice == 1:
+            channel_id = safe_input(f"{YELLOW}Cole o ID do Canal (DM, Grupo ou Servidor):{RESET} ").strip()
+            if channel_id:
+                try:
+                    delete_group_by_channel_id(channel_id, user_id, token_data)
+                except Exception as e:
+                    print(f"{RED}[ERRO INESPERADO]{RESET} Ocorreu um erro ao processar o ID: {e}")
+            else:
+                print(f"{YELLOW}[!]{RESET} ID de canal vazio. Cancelando.")
+            safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+        elif cleanup_choice == 2:
+            dms = get_dms(token_data['token'])
+            if dms:
+                dm_list = [d for d in dms if d.get('type') in [1, 3]]
+
+                print(f"\n{YELLOW}[!]{RESET} Você tem {len(dm_list)} canais de DM/Grupo para processar.")
+                confirm = safe_input(f"{RED}CONFIRMAR: Apagar mensagens de {len(dm_list)} canais? (s/n):{RESET} ").lower()
+                if confirm == 's':
+                    delete_all_dms(dm_list, user_id, token_data)
+            else:
+                print(f"{YELLOW}[!]{RESET} Nenhuma DM/Grupo encontrado.")
+            safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+        elif cleanup_choice == 3:
+            delete_inactive_dms(token_data)
+        else:
+            print(f"{RED}[✗]{RESET} Opção inválida.")
+            time.sleep(1)
+
+def manage_profile_aesthetics(token_data):
+    """Sub-menu para gerenciar a estética do perfil."""
+    while True:
+        clear()
+        print_banner()
+        print_centered_bar(f"GERENCIAR PERFIL (ESTÉTICA) - CONTA: {token_data['username']}")
+
+        print(f"{PURPLE}[ 1 ]{RESET} Mudar Nome de Usuário")
+        print(f"{PURPLE}[ 2 ]{RESET} Mudar Foto de Perfil (Avatar)")
+        print(f"{PURPLE}[ 3 ]{RESET} Mudar Bio / Sobre Mim")
+        print(f"{RED}[ 0 ]{RESET} Voltar")
+
+        try:
+            choice_str = safe_input(f"{GREEN}>{RESET} ").strip()
+            if not choice_str: continue
+            choice = int(choice_str)
+        except ValueError:
+            print(f"{RED}[✗]{RESET} Entrada inválida. Digite um número.")
+            time.sleep(1)
+            continue
+
+        if choice == 0:
+            break
+        elif choice == 1:
+            change_username_menu(token_data)
+        elif choice == 2:
+            change_avatar_menu(token_data)
+        elif choice == 3:
+            change_bio_menu(token_data)
+        else:
+            print(f"{RED}[✗]{RESET} Opção inválida.")
+            time.sleep(1)
+
+def change_username_menu(token_data):
+    """Muda o nome de usuário da conta."""
+    current_username = token_data['username']
+
+    clear()
+    print_banner()
+    print_centered_bar("MUDAR NOME DE USUÁRIO")
+    print(f"{CYAN}Nome Atual:{RESET} {current_username}")
+
+    new_username = safe_input(f"{YELLOW}Novo Nome de Usuário (Ex: MeuNovoNome):{RESET} ").strip()
+
+    if not new_username or new_username == current_username:
+        print(f"{YELLOW}[!]{RESET} Nome de usuário vazio ou inalterado. Cancelando.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    password = safe_input(f"{RED}SENHA ATUAL DO DISCORD (Obrigatória para alterar o nome):{RESET} ").strip()
+
+    if not password:
+        print(f"{RED}[✗]{RESET} Senha não fornecida. Alteração de nome cancelada.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    print(f"\n{RED}AVISO:{RESET} O script tentará a alteração com a senha fornecida.")
+
+    payload = {
+        'username': new_username,
+        'password': password
+    }
+
+    success, result = set_user_info(token_data['token'], payload)
+
+    if success:
+        print(f"\n{GREEN}[✓]{RESET} Nome de usuário alterado com sucesso para {BOLD}{new_username}{RESET}!")
+        token_data['username'] = new_username
+    else:
+        msg = result.get('message', 'Erro desconhecido.')
+        print(f"\n{RED}[✗]{RESET} Falha ao alterar o nome de usuário.")
+        print(f"{RED}Mensagem:{RESET} {msg}")
+
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+def change_avatar_menu(token_data):
+    """Muda a foto de perfil da conta usando Base64."""
+    clear()
+    print_banner()
+    print_centered_bar("MUDAR FOTO DE PERFIL (AVATAR)")
+
+    file_path = safe_input(f"{YELLOW}Caminho do arquivo de imagem (Ex: C:/user/img.png):{RESET} ").strip()
+
+    if not os.path.exists(file_path):
+        print(f"{RED}[✗]{RESET} Arquivo não encontrado no caminho especificado.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    is_png = file_path.lower().endswith('.png')
+    is_jpg = file_path.lower().endswith(('.jpg', '.jpeg'))
+    if not (is_png or is_jpg):
+        print(f"{RED}[✗]{RESET} Formato de arquivo não suportado. Use PNG ou JPG.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    mime_type = 'image/png' if is_png else 'image/jpeg'
+
+    try:
+        with open(file_path, 'rb') as f:
+            image_data = f.read()
+
+        base64_encoded = base64.b64encode(image_data).decode('utf-8')
+        avatar_data = f"data:{mime_type};base64,{base64_encoded}"
+
+        payload = {'avatar': avatar_data}
+
+        print(f"{YELLOW}[*]{RESET} Enviando imagem e atualizando perfil...")
+
+        success, result = set_user_info(token_data['token'], payload)
+
+        if success:
+            print(f"\n{GREEN}[✓]{RESET} Foto de perfil (Avatar) alterada com sucesso!")
+        else:
+            msg = result.get('message', 'Erro desconhecido.')
+            print(f"\n{RED}[✗]{RESET} Falha ao alterar o Avatar.")
+            print(f"{RED}Mensagem:{RESET} {msg}")
+
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro inesperado durante a leitura/codificação do arquivo: {e}")
+
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+def change_bio_menu(token_data):
+    """Muda a biografia/Sobre Mim da conta."""
+    clear()
+    print_banner()
+    print_centered_bar("MUDAR BIO / SOBRE MIM")
+
+    new_bio = safe_input(f"{YELLOW}Nova Biografia (máx. 190 caracteres):{RESET} ").strip()
+
+    if len(new_bio) > 190:
+        print(f"{RED}[✗]{RESET} A biografia excede o limite de 190 caracteres. Tente novamente.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    payload = {'bio': new_bio}
+    success, result = set_user_info(token_data['token'], payload)
+
+    if success:
+        print(f"\n{GREEN}[✓]{RESET} Biografia alterada com sucesso!")
+        print(f"{CYAN}Nova Bio:{RESET} {new_bio}")
+    else:
+        msg = result.get('message', 'Erro desconhecido.')
+        print(f"\n{RED}[✗]{RESET} Falha ao alterar a biografia.")
+        print(f"{RED}Mensagem:{RESET} {msg}")
+
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+def manage_tokens():
+    """Sub-menu para gerenciar tokens."""
+    while True:
+        clear()
+        print_banner()
+        print_centered_bar("GERENCIAR TOKENS")
+
+        tokens_list = load_tokens()
+
+        print(f"Tokens Carregados: {len(tokens_list)}\n")
+
+        print(f"{PURPLE}[ 1 ]{RESET} Adicionar Novo Token")
+        print(f"{PURPLE}[ 2 ]{RESET} Remover Token Existente")
+        print(f"{PURPLE}[ 3 ]{RESET} Listar Tokens Detalhadamente")
+        print(f"{PURPLE}[ 4 ]{RESET} {BOLD}Verificar Status de Todos os Tokens{RESET}")
+        print(f"{RED}[ 0 ]{RESET} Voltar")
+
+        try:
+            choice_str = safe_input(f"{GREEN}>{RESET} ").strip()
+            if not choice_str: continue
+            choice = int(choice_str)
+        except ValueError:
+            print(f"{RED}[✗]{RESET} Entrada inválida. Digite um número.")
+            time.sleep(1)
+            continue
+
+        if choice == 0:
+            break
+        elif choice == 1:
+            add_new_token()
+        elif choice == 2:
+            remove_token_menu(tokens_list)
+        elif choice == 3:
+            list_tokens_detailed(tokens_list)
+        elif choice == 4:
+            check_all_tokens_status(tokens_list)
+        else:
+            print(f"{RED}[✗]{RESET} Opção inválida.")
+            time.sleep(1)
+
+def add_new_token():
+    """Adiciona e valida um novo token à lista."""
+    new_token = safe_input(f"{YELLOW}Cole o NOVO TOKEN aqui:{RESET} ").strip()
+
+    if not new_token:
+        print(f"{YELLOW}[!]{RESET} Token vazio. Cancelando.")
+        time.sleep(1)
+        return
+
+    print(f"{YELLOW}[*]{RESET} Validando token, aguarde...")
+    user_info = get_user_info(new_token)
+
+    if user_info:
+        tokens_list = load_tokens()
+
+        if any(t.get('token') == new_token for t in tokens_list):
+            print(f"{RED}[✗]{RESET} Token da conta {user_info['username']} já existe na lista.")
+            safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+            return
+
+        tokens_list.append(user_info)
+        save_tokens(tokens_list)
+
+        username_display = user_info['username']
+        discriminator_display = user_info.get('discriminator', '0')
+        if discriminator_display == '0':
+            print(f"\n{GREEN}[✓]{RESET} Token da conta {BOLD}{username_display}{RESET}{GREEN} adicionado com sucesso!{RESET}")
+        else:
+            print(f"\n{GREEN}[✓]{RESET} Token da conta {BOLD}{username_display}#{discriminator_display}{RESET}{GREEN} adicionado com sucesso!{RESET}")
+    else:
+        print(f"{RED}[✗]{RESET} Token inválido ou expirado. Não foi possível conectar à API.")
+
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+def remove_token_menu(tokens_list):
+    """Permite ao usuário selecionar e remover um token."""
+    if not tokens_list:
+        print(f"{YELLOW}[!]{RESET} Nenhum token para remover.")
+        time.sleep(1)
+        return
+
+    clear()
+    print_banner()
+    print_centered_bar("REMOVER TOKEN")
+
+    for i, token_data in enumerate(tokens_list):
+        username = token_data['username']
+        discriminator = token_data.get('discriminator', '0')
+        if discriminator == '0':
+            display_name = username
+        else:
+            display_name = f"{username}#{discriminator}"
+
+        print(f"{PURPLE}[ {i+1} ]{RESET} {display_name}")
+
+    print(f"{RED}[ 0 ]{RESET} Cancelar")
+
+    try:
+        choice_str = safe_input(f"{GREEN}> Selecione o número do token a remover:{RESET} ").strip()
+        if not choice_str: return
+        choice = int(choice_str)
+
+        if choice == 0:
+            return
+
+        if 0 < choice <= len(tokens_list):
+            token_to_remove = tokens_list[choice - 1]
+
+            confirm = safe_input(f"{RED}CONFIRMAR: Remover o token de {token_to_remove['username']}? (s/n):{RESET} ").lower()
+
+            if confirm == 's':
+                tokens_list.pop(choice - 1)
+                save_tokens(tokens_list)
+                print(f"{GREEN}[✓]{RESET} Token de {token_to_remove['username']} removido com sucesso!")
+            else:
+                print(f"{YELLOW}[!]{RESET} Remoção cancelada.")
+        else:
+            print(f"{RED}[✗]{RESET} Opção inválida.")
+
+    except ValueError:
+        print(f"{RED}[✗]{RESET} Entrada inválida. Digite um número.")
+
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+def list_tokens_detailed(tokens_list):
+    """Lista todos os tokens com informações."""
+    clear()
+    print_banner()
+    print_centered_bar("LISTA DETALHADA DE TOKENS")
+
+    if not tokens_list:
+        print(f"{YELLOW}[!]{RESET} Nenhum token carregado.")
+    else:
+        print(f"{BOLD}Total de Tokens:{RESET} {len(tokens_list)}\n")
+
+        table_lines = [f"{CYAN}#{RESET} | {BOLD}Usuário{RESET:<30} | {BOLD}ID{RESET:<20} | {BOLD}Token (Início){RESET}"]
+        table_lines.append(f"{CYAN}{'─' * 105}{RESET}")
+
+        for i, token_data in enumerate(tokens_list):
+            username = token_data['username']
+            discriminator = token_data.get('discriminator', '0')
+            if discriminator == '0':
+                username_display = username
+            else:
+                username_display = f"{username}#{discriminator}"
+
+            user_id = token_data['id']
+            token_snippet = token_data['token'][:10] + '...'
+
+            table_lines.append(f"{i+1:<1} | {username_display:<30} | {user_id:<20} | {token_snippet}")
+
+        print('\n'.join(table_lines))
+
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+def select_token():
+    """Permite ao usuário selecionar um token ativo."""
+    tokens_list = load_tokens()
+    if not tokens_list:
+        print(f"{RED}[✗]{RESET} Nenhum token salvo. Adicione um token primeiro.")
+        time.sleep(1)
+        return None
+
+    clear()
+    print_banner()
+    print_centered_bar("SELECIONE UM TOKEN")
+
+    for i, token_data in enumerate(tokens_list):
+        username = token_data['username']
+        discriminator = token_data.get('discriminator', '0')
+        if discriminator == '0':
+            display_name = username
+        else:
+            display_name = f"{username}#{discriminator}"
+
+        print(f"{PURPLE}[ {i+1} ]{RESET} {display_name}")
+
+    print(f"{RED}[ 0 ]{RESET} Voltar")
+
+    try:
+        choice_str = safe_input(f"{GREEN}>{RESET} ").strip()
+        if not choice_str: return None
+        choice = int(choice_str)
+
+        if 1 <= choice <= len(tokens_list):
+            selected = tokens_list[choice - 1]
+            return selected
+        elif choice == 0:
+            return None
+        else:
+            print(f"{RED}[✗]{RESET} Opção inválida.")
+            time.sleep(1)
+            return None
+    except ValueError:
+        print(f"{RED}[✗]{RESET} Entrada inválida. Digite um número.")
+        time.sleep(1)
+        return None
+
+def mass_dm_menu(token_data):
+    """Realiza DM em massa para uma lista de IDs."""
+    global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS
+
+    clear()
+    print_banner()
+    print_centered_bar(f"DM EM MASSA - CONTA: {token_data['username']}")
+
+    user_ids_raw = safe_input(f"{YELLOW}Cole os IDs dos Usuários (separados por vírgula ou espaço):{RESET} ").strip()
+    message = safe_input(f"{YELLOW}Digite a mensagem a ser enviada:{RESET} ").strip()
+
+    if not user_ids_raw or not message:
+        print(f"{RED}[✗]{RESET} IDs e mensagem não podem ser vazios.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    user_ids = re.split(r'[\s,]+', user_ids_raw)
+    user_ids = [uid.strip() for uid in user_ids if uid.strip()]
+
+    print(f"\n{YELLOW}[!]{RESET} Serão enviadas {len(user_ids)} DMs.")
+    confirm = safe_input(f"{RED}CONFIRMAR: Iniciar DM em Massa? (s/n):{RESET} ").lower()
+
+    if confirm != 's':
+        print(f"{YELLOW}[!]{RESET} DM em Massa cancelada.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    GLOBAL_RP_STATE = "DM em Massa"
+    GLOBAL_RP_DETAILS = "Enviando {} mensagens".format(len(user_ids))
+
+    sent_count = 0
+
+    print()
+    progress_bar = ProgressBar(len(user_ids), desc="Enviando DMs", bar_length=30)
+
+    for target_id in user_ids:
+        if not target_id:
+            progress_bar.update(1)
+            continue
+
+        headers = headers_template.copy()
+        headers['Authorization'] = token_data['token']
+        url = 'https://discord.com/api/v10/users/@me/channels'
+        data = {"recipient_id": target_id}
+
+        apply_delay()
+
+        try:
+            response = requests.post(url, headers=headers, json=data, timeout=10, proxies=GLOBAL_PROXY)
+            if response.status_code not in [200, 201]:
+                progress_bar.update(1)
+                continue
+
+            channel_id = response.json().get('id')
+
+            # O envio de mensagem agora recebe 'message' como argumento
+            success, error = send_message(channel_id, token_data['token'], message)
+
+            if success:
+                sent_count += 1
+
+            progress_bar.update(1)
+
+        except Exception as e:
+            progress_bar.update(1)
+
+    progress_bar.close()
+
+    GLOBAL_RP_STATE = "Menu Principal"
+    GLOBAL_RP_DETAILS = "Gerenciando Minha Conta Discord"
+    # Força a atualização do RP após a operação
+    update_rich_presence() 
+
+    print(f"\n{GREEN}[✓]{RESET} DM em Massa concluída. Total enviadas: {sent_count}/{len(user_ids)}.")
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+def kosame_farm_menu(token_data):
+    """
+    Rotina de Farm Inteligente para o bot Kosame.
+    Envia comandos baseados em seus cooldowns internos.
+    """
+    global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS, KOSAME_COMMANDS
+    
+    token = token_data['token']
+    user_id = token_data['id']
+    
+    # Define o ciclo mínimo de verificação (Ex: 1 minuto, para 'k!work')
+    MIN_CHECK_INTERVAL = 60 
+
+    clear()
+    print_banner()
+    print_centered_bar(f"FARM INTELIGENTE KOSAME - CONTA: {token_data['username']}")
+
+    channel_id = safe_input(f"{YELLOW}Cole o ID do Canal onde o bot Kosame está ativo:{RESET} ").strip()
+    if not channel_id:
+        print(f"{RED}[✗]{RESET} ID de canal não pode ser vazio. Cancelando.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+    
+    # Carrega o histórico de execução (timestamp da última execução)
+    farm_history = load_kosame_farm_data(user_id)
+    time_start_loop = time.time() # Tempo para referência do início do processo
+    
+    print(f"\n{CYAN}--- INICIANDO ROTINA DE FARM ---{RESET}")
+    print(f"{YELLOW}Pressione Ctrl+C a qualquer momento para parar.{RESET}")
+    
+    GLOBAL_RP_STATE = "Farm Bot Kosame (Auto)"
+    
+    try:
+        while True:
+            sent_this_cycle = 0
+            time_now = time.time()
+            # Próxima execução de longo prazo (Daily, Weekly, Monthly)
+            next_command_available_at = time_now + 3600 * 24 * 365 
+
+            # Itera sobre a lista de comandos a serem enviados
+            for command_info in KOSAME_COMMANDS:
+                cmd = command_info['cmd']
+                cooldown = command_info['cooldown_seconds']
+                description = command_info['description']
+                
+                # Usa o 'cmd' como chave de histórico para rastrear o cooldown
+                last_run = farm_history.get(cmd, 0)
+                time_since_last_run = time_now - last_run
+                
+                # Verifica se o comando está pronto para ser executado
+                if time_since_last_run >= cooldown:
+                    
+                    # Atualiza o Rich Presence antes de enviar
+                    GLOBAL_RP_DETAILS = f"Executando: {cmd} ({description})"
+                    
+                    print(f"\n{GREEN}[✓ Farm Ready]{RESET} Enviando: {cmd} ({description})")
+
+                    # Envia a mensagem (send_message já aplica o delay do script)
+                    # Corrigido para passar o argumento 'message'
+                    success, error = send_message(channel_id, token, cmd) 
+
+                    if success:
+                        # Atualiza o histórico e salva
+                        farm_history[cmd] = time_now
+                        save_kosame_farm_data(user_id, farm_history)
+                        sent_this_cycle += 1
+                        print(f"{GREEN}[✓]{RESET} Comando '{cmd}' enviado com sucesso.")
+                    else:
+                        print(f"{RED}[✗]{RESET} Falha ao enviar '{cmd}'. Erro: {error}")
+                        # Se for um Rate Limit, o send_message já espera
+
+                else:
+                    # Calcula o tempo restante para atualizar o próximo tempo de execução
+                    time_remaining = cooldown - time_since_last_run
+                    next_run_time = time_now + time_remaining
+                    
+                    # Atualiza o tempo mais cedo que um comando de longo prazo estará pronto
+                    next_command_available_at = min(next_command_available_at, next_run_time)
+                    
+                    # Comandos de longo prazo (diário, semanal) só são reportados uma vez
+                    if cooldown > MIN_CHECK_INTERVAL:
+                         print(f"{CYAN}[* Cooldown]{RESET} {cmd} disponível em: {datetime.timedelta(seconds=int(time_remaining))}")
+            
+            # --- FIM DO CICLO DE ENVIO ---
+            
+            if sent_this_cycle == 0:
+                print(f"\n{YELLOW}[*]{RESET} Nenhum comando pronto neste ciclo.")
+            
+            # O tempo de espera será o tempo até o próximo comando de longo prazo,
+            # limitado pelo MIN_CHECK_INTERVAL (60 segundos) para garantir que
+            # comandos de 1 e 5 minutos sejam checados frequentemente.
+            
+            # Se o próximo comando for de curto prazo (< 60s), ele é coberto
+            # Se o próximo for de longo prazo (> 60s), esperamos apenas 60s para checar
+            # se algum comando de 1 ou 5 min ficou pronto.
+            wait_for_next_run = next_command_available_at - time_now
+            
+            wait_time = MIN_CHECK_INTERVAL
+            
+            if wait_for_next_run < MIN_CHECK_INTERVAL:
+                 wait_time = max(5, wait_for_next_run) # Mínimo de 5 segundos
+            
+            print(f"{YELLOW}[*]{RESET} Próxima verificação de comandos em {wait_time:.1f} segundos...")
+
+            # Atualiza o RP com o status do ciclo antes de dormir
+            GLOBAL_RP_DETAILS = f"Aguardando próximo ciclo em {int(wait_time)}s"
+            
+            time.sleep(wait_time)
+
+
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}[!] Farm interrompido pelo usuário.{RESET}")
+    except Exception as e:
+        print(f"\n{RED}[ERRO INESPERADO]{RESET} Ocorreu um erro no loop de farm: {e}")
+
+    GLOBAL_RP_STATE = "Menu Principal"
+    GLOBAL_RP_DETAILS = "Gerenciando Minha Conta Discord"
+    # Força a atualização do RP após a operação
+    update_rich_presence() 
+    
+    print(f"\n{CYAN}--- ROTINA DE FARM FINALIZADA ---{RESET}")
+    safe_input(f"\n{CYAN}Pressione ENTER para voltar ao Menu Principal...{RESET}")
+
+def backup_messages_html_menu(token_data):
+    """Realiza backup de mensagens em formato HTML."""
+    global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS
+
+    clear()
+    print_banner()
+    print_centered_bar(f"BACKUP DE MENSAGENS (HTML) - CONTA: {token_data['username']}")
+
+    channel_id = safe_input(f"{YELLOW}Cole o ID do Canal/DM/Grupo para backup:{RESET} ").strip()
+
+    if not channel_id:
+        print(f"{RED}[✗]{RESET} ID de canal não pode ser vazio.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    channel_info = get_channel_id_info(channel_id, token_data['token'])
+    if not channel_info:
+        print(f"{RED}[✗]{RESET} ID de canal inválido ou sem acesso.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    channel_obj = {
+        'id': channel_id,
+        'type': channel_info.get('type'),
+        'recipients': channel_info.get('recipients'),
+        'name': channel_info.get('name')
+    }
+    channel_name = get_channel_name(channel_obj)
+
+    print(f"{CYAN}Canal Selecionado:{RESET} {channel_name} ({channel_id})")
+
+    confirm = safe_input(f"{RED}CONFIRMAR: Iniciar backup? (s/n):{RESET} ").lower()
+    if confirm != 's':
+        print(f"{YELLOW}[!]{RESET} Backup cancelado.")
+        GLOBAL_RP_STATE = "Menu Principal"
+        GLOBAL_RP_DETAILS = "Gerenciando Minha Conta Discord"
+        # Força a atualização do RP após a operação
+        update_rich_presence() 
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    GLOBAL_RP_STATE = "Fazendo Backup (HTML)"
+    GLOBAL_RP_DETAILS = f"Exportando {channel_name}"
+
+    all_messages = get_messages(channel_id, token_data['token'], user_id=None)
+
+    if not all_messages:
+        print(f"{YELLOW}[!]{RESET} Nenhuma mensagem encontrada para backup.")
+        GLOBAL_RP_STATE = "Menu Principal"
+        GLOBAL_RP_DETAILS = "Gerenciando Minha Conta Discord"
+        # Força a atualização do RP após a operação
+        update_rich_presence() 
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    filename = f"backup_{channel_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+
+    print(f"\n{YELLOW}[*]{RESET} Gerando arquivo HTML...\n")
+
+    html_content = f"""
+    <html>
+    <head>
+        <title>Backup de Mensagens - {channel_name}</title>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: sans-serif; background-color: #2f3136; color: #dcddde; padding: 20px; }}
+            .message {{ margin-bottom: 10px; padding: 10px; border-left: 3px solid #7289da; background-color: #36393f; }}
+            .author {{ font-weight: bold; color: #7289da; }}
+            .timestamp {{ font-size: 0.8em; color: #a3a6aa; margin-left: 10px; }}
+            .content {{ margin-top: 5px; }}
+            .attachment {{ display: block; margin-top: 5px; color: #00b0f4; }}
+            h1 {{ color: #ffffff; }}
+        </style>
+    </head>
+    <body>
+        <h1>Backup de Mensagens: {channel_name}</h1>
+        <p>Total de mensagens: {len(all_messages)}</p>
+        <p>Data do backup: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</p>
+        <hr>
+    """
+
+    progress_bar = ProgressBar(len(all_messages), desc="Processando mensagens", bar_length=30, show_count=False)
+
+    for msg in reversed(all_messages):
+        try:
+            timestamp = datetime.datetime.strptime(msg['timestamp'][:19], '%Y-%m-%dT%H:%M:%S').strftime('%d/%m/%Y %H:%M:%S')
+        except:
+            timestamp = "Data desconhecida"
+
+        author = msg.get('author', {}).get('username', 'Desconhecido')
+        content = msg.get('content', '[Sem conteúdo de texto]')
+
+        attachments_html = ""
+        for att in msg.get('attachments', []):
+            attachments_html += f"<a class='attachment' href='{att['url']}' target='_blank'>[Anexo: {att['filename']} ({att['size']} bytes)]</a>"
+
+        html_content += f"""
+        <div class="message">
+            <span class="author">{author}</span>
+            <span class="timestamp">{timestamp}</span>
+            <div class="content">{content.replace('\n', '<br>')}{attachments_html}</div>
+        </div>
+        """
+
+        progress_bar.update(1)
+
+    html_content += "</body></html>"
+
+    progress_bar.close()
+
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        print(f"\n{GREEN}[✓]{RESET} Backup concluído! Arquivo salvo como: {BOLD}{filename}{RESET}")
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro ao salvar o arquivo HTML: {e}")
+
+    GLOBAL_RP_STATE = "Menu Principal"
+    GLOBAL_RP_DETAILS = "Gerenciando Minha Conta Discord"
+    # Força a atualização do RP após a operação
+    update_rich_presence() 
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+def configure_intelligent_delay_menu():
+    """Menu de configuração do Delay Inteligente."""
+    global GLOBAL_DELAY_BASE_SECONDS, GLOBAL_DELAY_MAX_DEVIATION, GLOBAL_RP_STATE, GLOBAL_RP_DETAILS
+
+    original_state = GLOBAL_RP_STATE
+    original_details = GLOBAL_RP_DETAILS
+
+    GLOBAL_RP_STATE = "Configurando Delay"
+    GLOBAL_RP_DETAILS = "Ajustando perfis de ação"
+    # Força a atualização do RP
+    update_rich_presence() 
+
+    while True:
+        clear()
+        print_banner()
+        load_delay_config()
+
+        print_centered_bar("CONFIGURACAO DELAY INTELIGENTE")
+
+        print(f"{BOLD}Configuração Atual:{RESET}")
+        print(f"Delay Base: {GLOBAL_DELAY_BASE_SECONDS:.2f}s | Desvio Máximo: ±{GLOBAL_DELAY_MAX_DEVIATION:.2f}s")
+        print(f"{CYAN}Intervalo Atual: {max(0.1, GLOBAL_DELAY_BASE_SECONDS - GLOBAL_DELAY_MAX_DEVIATION):.2f}s a {GLOBAL_DELAY_BASE_SECONDS + GLOBAL_DELAY_MAX_DEVIATION:.2f}s{RESET}")
+
+        print(f"\n{BOLD}Escolha um Perfil de Ação:{RESET}")
+        print(f"{CYAN}--------------------------------------------------------------{RESET}")
+
+        for num, profile in DELAY_PROFILES.items():
+            if profile['base'] is not None:
+                print(f"{PURPLE}[ {num} ]{RESET} {profile['name']} ({profile['base']:.1f}s ± {profile['dev']:.1f}s)")
+            else:
+                print(f"{PURPLE}[ {num} ]{RESET} {profile['name']} (Permite ajuste manual)")
+
+        print(f"\n{RED}[ 0 ]{RESET} Voltar")
+        print(f"{CYAN}{'─' * 62}{RESET}")
+
+        try:
+            choice = safe_input(f"{GREEN}>{RESET} ").strip()
+            if not choice: continue
+            choice = int(choice)
+        except ValueError:
+            print(f"{RED}[✗]{RESET} Entrada inválida. Digite um número.")
+            time.sleep(1)
+            continue
+
+        if choice == 0:
+            break
+
+        if choice in DELAY_PROFILES:
+            profile = DELAY_PROFILES[choice]
+
+            if choice in [1, 2, 3]:
+                GLOBAL_DELAY_BASE_SECONDS = profile['base']
+                GLOBAL_DELAY_MAX_DEVIATION = profile['dev']
+                save_delay_config()
+                print(f"{GREEN}[✓]{RESET} Perfil '{profile['name']}' ({profile['base']:.1f}s) ativado.")
+                time.sleep(1)
+
+            elif choice == 4:
+                try:
+                    new_base_str = safe_input(f"{YELLOW}Novo Delay Base (Segundos > 0):{RESET} ").strip()
+                    if not new_base_str: continue
+                    new_base = float(new_base_str)
+
+                    new_dev_str = safe_input(f"{YELLOW}Novo Desvio Máximo (Segundos >= 0):{RESET} ").strip()
+                    if not new_dev_str: continue
+                    new_dev = float(new_dev_str)
+
+                    if new_base <= 0 or new_dev < 0 or new_dev >= new_base:
+                        print(f"{RED}[✗]{RESET} Valores inválidos. O Delay Base deve ser > 0 e > Desvio Máximo.")
+                    else:
+                        GLOBAL_DELAY_BASE_SECONDS = new_base
+                        GLOBAL_DELAY_MAX_DEVIATION = new_dev
+                        save_delay_config()
+                        print(f"{GREEN}[✓]{RESET} Configuração Personalizada ({new_base:.2f}s) salva.")
+                except ValueError:
+                    print(f"{RED}[✗]{RESET} Entrada inválida. Use números.")
+                except Exception as e:
+                    print(f"{RED}[✗]{RESET} Erro: {e}")
+
+                time.sleep(2)
+        else:
+            print(f"{RED}[✗]{RESET} Opção inválida.")
+            time.sleep(1)
+
+    GLOBAL_RP_STATE = original_state
+    GLOBAL_RP_DETAILS = original_details
+    # Força a atualização do RP após a operação
+    update_rich_presence()
+
+def get_user_guilds(token):
+    """Obtém a lista de servidores do usuário."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    headers['X-Context-Properties'] = 'eyJsb2NhdGlvbiI6Ikd1aWxkIERpcmVjdG9yeSJ9'
+
+    url = 'https://discord.com/api/v10/users/@me/guilds'
+    try:
+        response = requests.get(url, headers=headers, timeout=10, proxies=GLOBAL_PROXY)
+        if response.status_code == 200:
+            return response.json()
+        return []
+    except:
+        return []
+
+def leave_server(guild_id, token):
+    """Sai de um servidor específico."""
+    headers = headers_template.copy()
+    headers['Authorization'] = token
+    headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    headers['X-Context-Properties'] = 'eyJsb2NhdGlvbiI6Ikd1aWxkIERpcmVjdG9yeSJ9'
+
+    url = f'https://discord.com/api/v10/users/@me/guilds/{guild_id}'
+
+    apply_delay()
+
+    try:
+        response = requests.delete(url, headers=headers, timeout=10, proxies=GLOBAL_PROXY)
+        if response.status_code == 204:
+            return True, None
+
+        if response.status_code == 429:
+            retry_after = response.json().get('retry_after', 5)
+            print(f"\n{RED}[!] Rate Limit: Esperando {retry_after:.1f} segundos...{RESET}")
+            time.sleep(retry_after)
+            return leave_server(guild_id, token)
+
+        error_message = response.json().get('message', f"Erro {response.status_code}")
+        return False, error_message
+    except Exception as e:
+        return False, str(e)
+
+def leave_servers_menu(token_data):
+    """Menu para sair de todos os servidores em massa."""
+    global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS
+
+    clear()
+    print_banner()
+    print_centered_bar(f"SAIR DE SERVIDORES EM MASSA - CONTA: {token_data['username']}")
+
+    guilds = get_user_guilds(token_data['token'])
+    if not guilds:
+        print(f"{YELLOW}[!]{RESET} Nenhum servidor encontrado para sair.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    print(f"\n{YELLOW}[!]{RESET} Você é membro de {len(guilds)} servidores.")
+
+    confirm = safe_input(f"{RED}CONFIRMAR: Sair de TODOS os {len(guilds)} servidores? (s/n):{RESET} ").lower()
+    if confirm != 's':
+        print(f"{YELLOW}[!]{RESET} Operação cancelada.")
+        safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+        return
+
+    GLOBAL_RP_STATE = "Saindo de Servidores"
+    GLOBAL_RP_DETAILS = "Deixando {} servidores".format(len(guilds))
+
+    left_count = 0
+
+    print()
+    progress_bar = ProgressBar(len(guilds), desc="Saindo de servidores", bar_length=30)
+
+    for guild in guilds:
+        guild_id = guild['id']
+
+        success, error = leave_server(guild_id, token_data['token'])
+
+        if success:
+            left_count += 1
+
+        progress_bar.update(1)
+
+    progress_bar.close()
+
+    GLOBAL_RP_STATE = "Menu Principal"
+    GLOBAL_RP_DETAILS = "Gerenciando Minha Conta Discord"
+    # Força a atualização do RP após a operação
+    update_rich_presence()
+
+    print(f"\n{GREEN}[✓]{RESET} Operação concluída. Total de servidores deixados: {left_count}/{len(guilds)}.")
+    safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+# Funções de Rich Presence
+
+def load_rp_config():
+    """Carrega a configuração de Rich Presence salva."""
+    config = RICH_PRESENCE_DEFAULTS.copy()
+    try:
+        if os.path.exists(RICH_PRESENCE_CONFIG_FILE):
+            with open(RICH_PRESENCE_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                saved_config = json.load(f)
+            config.update(saved_config)
+    except:
+        pass
+
+    for key, default_val in RICH_PRESENCE_DEFAULTS.items():
+        if key not in config:
+            config[key] = default_val
+    return config
+
+def save_rp_config(config):
+    """Salva a configuração de Rich Presence."""
+    try:
+        with open(RICH_PRESENCE_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        print(f"{RED}[✗]{RESET} Erro ao salvar configuração de RP: {e}")
+        return False
+
+def rp_background_updater():
+    """Thread para manter a Rich Presence atualizada."""
+    global RP_RUNNING_FLAG
+    RP_RUNNING_FLAG = True
+    while RP_RUNNING_FLAG:
+        update_rich_presence()
+        for _ in range(RP_UPDATE_INTERVAL):
+            if not RP_RUNNING_FLAG:
+                break
+            time.sleep(1)
+
+def start_rich_presence():
+    """Inicia a conexão com o Discord e o thread de atualização."""
+    global RPC, RP_THREAD, RP_RUNNING_FLAG
+    config = load_rp_config()
+
+    if not config.get('rp_active', True):
+        return
+
+    # 1. Tenta conectar o RPC (se já não estiver)
+    if RPC is None:
+        try:
+            RPC = Presence(RICH_PRESENCE_CLIENT_ID)
+            RPC.connect()
+        except Exception:
+            RPC = DummyPresence(RICH_PRESENCE_CLIENT_ID)
+            RPC.connect()
+            RPC = None
+            return # Falha na conexão
+
+    # 2. Inicia o thread de atualização (se já não estiver)
+    if RP_THREAD is None or not RP_THREAD.is_alive():
+        RP_THREAD = threading.Thread(target=rp_background_updater)
+        RP_THREAD.daemon = True
+        RP_THREAD.start()
+
+    update_rich_presence() # Primeira atualização imediata
+
+def stop_rich_presence():
+    """Para a conexão com o Discord e o thread de atualização."""
+    global RPC, RP_THREAD, RP_RUNNING_FLAG
+    RP_RUNNING_FLAG = False
+    if RPC is not None:
+        try:
+            RPC.close()
+            RPC = None
+        except:
+            pass
+    if RP_THREAD is not None:
+        try:
+            pass
+        except:
+            pass
+
+def update_rich_presence():
+    """Atualiza o Rich Presence com o estado global atualizado."""
+    global RPC, GLOBAL_RP_STATE, GLOBAL_RP_DETAILS, GLOBAL_LAST_INPUT_TIME, GLOBAL_CLEANUP_MODE, GLOBAL_DELETED_COUNT, GLOBAL_RP_PROGRESS
+
+    config = load_rp_config()
+    if RPC is None or not config.get('rp_active', True):
+        return
+
+    details = GLOBAL_RP_DETAILS
+    state = GLOBAL_RP_STATE
+
+    # Lógica de atualização de estado dinâmico (limpeza de mensagens, etc.)
+    if GLOBAL_CLEANUP_MODE:
+        # Modo de Limpeza (apagando mensagens)
+        details = f"Limpando: {GLOBAL_RP_DETAILS}"
+        state = f"Apagadas: {GLOBAL_DELETED_COUNT}"
+        if GLOBAL_RP_PROGRESS:
+             state += f" {GLOBAL_RP_PROGRESS}"
+        else:
+             state += " (Processando)"
+    elif GLOBAL_RP_PROGRESS:
+        # Outras operações longas (DM em massa, sair de servidores)
+        state = f"{GLOBAL_RP_STATE} {GLOBAL_RP_PROGRESS}"
+    
+    start_time_rp = GLOBAL_LAST_INPUT_TIME
+
+    try:
+        buttons_list = []
+        if config['button_text'] and config['button_url']:
+            buttons_list.append({"label": config['button_text'], "url": config['button_url']})
+
+        RPC.update(
+            details=details,
+            state=state,
+            start=start_time_rp,
+            large_image=config['large_image_name'],
+            large_text=config['large_text'],
+            buttons=buttons_list
+        )
+    except Exception as e:
+        # Erro de conexão, tenta reconectar na próxima iteração do thread.
+        pass
+
+def toggle_rich_presence_state(should_start: bool):
+    """Inicia ou para o Rich Presence."""
+    global RPC
+    config = load_rp_config()
+
+    if should_start:
+        if RPC is None or not config.get('rp_active', True):
+            config['rp_active'] = True
+            save_rp_config(config)
+            start_rich_presence()
+            if RPC is not None:
+                print(f"{GREEN}[✓]{RESET} Rich Presence iniciado.")
+            else:
+                print(f"{YELLOW}[!] Rich Presence não pôde ser iniciado (pypresence ausente ou erro de conexão).{RESET}")
+        else:
+            config['rp_active'] = True
+            save_rp_config(config)
+            print(f"{CYAN}[*]{RESET} Rich Presence já estava ativo.")
+
+    elif not should_start:
+        if RPC is not None or config.get('rp_active', True):
+            config['rp_active'] = False
+            save_rp_config(config)
+            stop_rich_presence()
+            print(f"{YELLOW}[!]{RESET} Rich Presence parado.")
+        else:
+            print(f"{CYAN}[*]{RESET} Rich Presence já estava parado.")
+
+    time.sleep(1)
+    # Força a atualização do RP após a operação
+    update_rich_presence()
+
+def rich_presence_menu():
+    """Menu de configuração do Rich Presence."""
+    global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS, RICH_PRESENCE_DEFAULTS, RPC
+
+    original_state = GLOBAL_RP_STATE
+    original_details = GLOBAL_RP_DETAILS
+
+    GLOBAL_RP_STATE = "Configurando Rich Presence"
+    GLOBAL_RP_DETAILS = "Ajustando o status do Discord"
+    # Força a atualização do RP
+    update_rich_presence()
+
+    while True:
+        clear()
+        print_banner()
+        current_config = load_rp_config()
+
+        is_active_in_config = current_config.get('rp_active', True)
+        if RPC is not None and is_active_in_config:
+            status_text = f"{GREEN}ATIVO{RESET}"
+        elif is_active_in_config and RPC is None:
+            status_text = f"{YELLOW}TENTATIVA DE CONEXÃO{RESET}"
+        else:
+            status_text = f"{RED}PARADO{RESET}"
+
+        print_centered_bar(f"CONFIGURACAO RICH PRESENCE (Status: {status_text})")
+
+        print(f"1. Detalhes (Superior): {current_config['details']}")
+        print(f"2. Estado (Inferior): {current_config['state']}")
+        print(f"3. Imagem Grande (Nome do Asset): {current_config['large_image_name']}")
+        print(f"4. Texto da Imagem Grande: {current_config['large_text']}")
+        print(f"5. Texto do Botao: {current_config['button_text']}")
+        print(f"6. URL do Botao: {current_config['button_url']}")
+
+        print(f"\n{BOLD}Controle Rápido:{RESET}")
+        print(f"{PURPLE}[ 9 ]{RESET} Testar/Atualizar RP Agora")
+        print(f"{PURPLE}[ 8 ]{RESET} Redefinir para Padrao")
+
+        if RPC is None or not is_active_in_config:
+            print(f"{GREEN}[ 7 ]{RESET} Iniciar Rich Presence")
+        else:
+            print(f"{YELLOW}[ 7 ]{RESET} Parar Rich Presence")
+
+        print(f"{RED}[ 0 ]{RESET} Voltar\n")
+
+        print(f"{CYAN}{'─' * 62}{RESET}")
+
+        try:
+            choice_str = safe_input(f"{GREEN}>{RESET} ").strip()
+            if not choice_str: continue
+            choice = int(choice_str)
+        except ValueError:
+            print(f"{RED}[✗]{RESET} Digite um número válido.")
+            time.sleep(1)
+            continue
+
+        if choice == 0:
+            break
+        elif choice == 9:
+            print(f"{GREEN}[✓]{RESET} Rich Presence atualizado com as novas configurações.")
+            # Reinicia para forçar a reconexão/leitura das configs salvas
+            stop_rich_presence()
+            current_config['rp_active'] = True
+            save_rp_config(current_config)
+            start_rich_presence()
+            time.sleep(1)
+            continue
+        elif choice == 8:
+            save_rp_config(RICH_PRESENCE_DEFAULTS.copy())
+            print(f"{GREEN}[✓]{RESET} Rich Presence redefinido para o padrao.")
+            stop_rich_presence()
+            toggle_rich_presence_state(True)
+            time.sleep(1)
+            continue
+        elif choice == 7:
+            if RPC is None or not is_active_in_config:
+                toggle_rich_presence_state(True)
+            else:
+                toggle_rich_presence_state(False)
+            continue
+
+        field_map = {
+            1: 'details', 2: 'state', 3: 'large_image_name',
+            4: 'large_text', 5: 'button_text', 6: 'button_url'
+        }
+
+        if choice in field_map:
+            field = field_map[choice]
+            new_value = safe_input(f"{YELLOW}Novo valor para {field} (atual: {current_config[field]}):{RESET} ").strip()
+
+            if new_value:
+                current_config[field] = new_value
+                if save_rp_config(current_config):
+                    print(f"{GREEN}[✓]{RESET} {field} atualizado e salvo.")
+                else:
+                    print(f"{RED}[✗]{RESET} Falha ao salvar.")
+
+                if RPC is not None and current_config.get('rp_active', True):
+                    update_rich_presence()
+            else:
+                print(f"{YELLOW}[!]{RESET} Valor vazio. Manter o atual.")
+            time.sleep(1)
+        else:
+            print(f"{RED}[✗]{RESET} Opção inválida.")
+            time.sleep(1)
+
+    GLOBAL_RP_STATE = original_state
+    GLOBAL_RP_DETAILS = original_details
+    # Força a atualização do RP após a operação
+    update_rich_presence()
+
+def configure_colors_menu():
+    """Menu para configurar as cores ANSI."""
+    global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS, RESET, PURPLE, CYAN, GREEN, YELLOW, RED, BOLD, WHITE
+
+    original_state = GLOBAL_RP_STATE
+    original_details = GLOBAL_RP_DETAILS
+
+    GLOBAL_RP_STATE = "Configurando Cores"
+    GLOBAL_RP_DETAILS = "Ajustando o tema do console"
+    # Força a atualização do RP
+    update_rich_presence()
+
+    ELEMENT_MAP = {
+        1: 'PURPLE', 2: 'CYAN', 3: 'GREEN',
+        4: 'YELLOW', 5: 'RED', 6: 'BOLD', 7: 'WHITE'
+    }
+
+    ELEMENT_NAME = {
+        'PURPLE': 'Cor Principal (Menu)',
+        'CYAN': 'Cor da Barra/Título',
+        'GREEN': 'Cor de Sucesso/OK',
+        'YELLOW': 'Cor de Aviso/Info',
+        'RED': 'Cor de Erro/Alerta',
+        'BOLD': 'Cor de Negrito (Estilo)',
+        'WHITE': 'Cor Secundária'
+    }
+
+    while True:
+        clear()
+        print_banner()
+        load_colors_config()
+
+        print_centered_bar("CONFIGURACAO DE CORES ANSI")
+
+        for num, var_name in ELEMENT_MAP.items():
+            friendly_name = ELEMENT_NAME[var_name]
+            current_color = globals()[var_name]
+            print(f"{PURPLE}[ {num} ]{RESET} {friendly_name}: {current_color}EXEMPLO{RESET}")
+
+        print(f"\n{PURPLE}[ 8 ]{RESET} Redefinir Cores para Padrão")
+        print(f"{RED}[ 0 ]{RESET} Voltar")
+
+        print(f"{CYAN}{'─' * 62}{RESET}")
+
+        try:
+            choice_str = safe_input(f"{GREEN}>{RESET} Selecione o número do {BOLD}ELEMENTO{RESET} para mudar:{RESET} ").strip()
+            if not choice_str: continue
+            choice = int(choice_str)
+        except ValueError:
+            print(f"{RED}[✗]{RESET} Digite um número válido.")
+            time.sleep(1)
+            continue
+
+        if choice == 0:
+            break
+        elif choice == 8:
+            save_colors_config(COLORS_DEFAULTS.copy())
+            load_colors_config()
+            print(f"{GREEN}[✓]{RESET} Cores redefinidas para o padrão.")
+            time.sleep(1)
+            # Força a atualização do RP após a operação
+            update_rich_presence()
+            continue
+
+        if choice in ELEMENT_MAP:
+            element_var = ELEMENT_MAP[choice]
+            element_name = ELEMENT_NAME[element_var]
+
+            clear()
+            print_banner()
+            print_centered_bar(f"MUDAR: {element_name}")
+            print(f"{CYAN}Cor Atual:{RESET} {globals()[element_var]}EXEMPLO{RESET}\n")
+
+            print(f"{YELLOW}Selecione a nova cor para {element_name}:{RESET}")
+
+            for color_num, color_data in ANSI_PALETTE.items():
+                if color_num >= 21:
+                    print(f"{color_data['exemplo']}{WHITE}[{color_num}] {color_data['name']}{RESET}")
+                else:
+                    print(f"{color_data['exemplo']}[ {color_num} ] {color_data['name']}{RESET}")
+
+            print(f"{RED}[ 0 ]{RESET} Cancelar")
+
+            try:
+                color_choice_str = safe_input(f"\n{GREEN}>{RESET} ").strip()
+                if not color_choice_str: continue
+                color_choice = int(color_choice_str)
+            except ValueError:
+                print(f"{RED}[✗]{RESET} Digite um número válido.")
+                time.sleep(1)
+                continue
+
+            if color_choice == 0:
+                continue
+
+            if color_choice in ANSI_PALETTE:
+                new_ansi_code = ANSI_PALETTE[color_choice]['code']
+
+                globals()[element_var] = new_ansi_code
+
+                config_to_save = {k: globals().get(k, COLORS_DEFAULTS[k]) for k in COLORS_DEFAULTS.keys()}
+
+                if save_colors_config(config_to_save):
+                    load_colors_config()
+                    print(f"{GREEN}[✓]{RESET} Cor de {element_name} atualizada para {ANSI_PALETTE[color_choice]['name']}!")
+                    print(f"{GREEN}Exemplo:{RESET} {globals()[element_var]}NOVA COR APLICADA{RESET}")
+                    # Força a atualização do RP após a operação
+                    update_rich_presence()
+                else:
+                    print(f"{RED}[✗]{RESET} Falha ao salvar a nova cor.")
+            else:
+                print(f"{RED}[✗]{RESET} Opção de cor inválida.")
+
+            time.sleep(2)
+        else:
+            print(f"{RED}[✗]{RESET} Opção de elemento inválida.")
+            time.sleep(1)
+
+    GLOBAL_RP_STATE = original_state
+    GLOBAL_RP_DETAILS = original_details
+    # Força a atualização do RP após a operação
+    update_rich_presence()
+
+def main_menu():
+    """Menu principal do script."""
+    global GLOBAL_RP_STATE, GLOBAL_RP_DETAILS, GLOBAL_RP_TOKEN_DATA
+    tokens_list = load_tokens()
+    start_rich_presence() # Inicia o RP e o thread de atualização
+
+    while True:
+        load_colors_config()
+
+        # Define o estado padrão
+        GLOBAL_RP_STATE = "Menu Principal"
+        GLOBAL_RP_DETAILS = "Gerenciando Minha Conta Discord"
+        # O thread de RP cuida da atualização periódica
+
+        clear()
+        print_banner()
+
+        tokens_list = load_tokens()
+        print(f"Tokens Salvos: {len(tokens_list)}\n")
+
+        print(f"{CYAN}╔══════════════════════════════════════════════════════════════╗{RESET}")
+        print(f"{CYAN}║{RESET}  {BOLD}MENU PRINCIPAL{RESET}                                            {CYAN}║{RESET}")
+        print(f"{CYAN}╚══════════════════════════════════════════════════════════════╝{RESET}\n")
+
+        print(f"{PURPLE}[ 1 ]{RESET} Gerenciar Tokens")
+        print(f"{PURPLE}[ 2 ]{RESET} Limpeza de Mensagens (API - Usa Delay Configurado)")
+        print(f"{PURPLE}[ 3 ]{RESET} DM em Massa (Spam)")
+        print(f"{PURPLE}[ 4 ]{RESET} Backup de Mensagens (HTML)")
+        print(f"{PURPLE}[ 5 ]{RESET} Configurar Delay Inteligente (Perfis)")
+        print(f"{PURPLE}[ 6 ]{RESET} Sair de Servidores em Massa")
+        print(f"{PURPLE}[ 7 ]{RESET} Rich Presence (Configurar/Status)")
+        print(f"{PURPLE}[ 8 ]{RESET} Configurar Cores do Console")
+        print(f"{PURPLE}[ 9 ]{RESET} Gerenciar Estética do Perfil (Nome, Avatar, Bio)")
+        print(f"{PURPLE}[ 10 ]{RESET} {BOLD}Farm Inteligente Bot Kosame (Auto Cooldown){RESET}") # NOVO
+
+        print(f"{RED}[ 0 ]{RESET} Sair\n")
+
+        print(f"{CYAN}{'─' * 62}{RESET}")
+
+        try:
+            choice_str = safe_input(f"{GREEN}>{RESET} ").strip()
+            if not choice_str: continue
+            choice = int(choice_str)
+        except ValueError:
+            print(f"{RED}[✗]{RESET} Entrada inválida. Use um número inteiro.")
+            time.sleep(1)
+            continue
+
+        try:
+            # Opções que não precisam de seleção de token
+            if choice == 1:
+                manage_tokens()
+                tokens_list = load_tokens()
+            elif choice == 5:
+                configure_intelligent_delay_menu()
+            elif choice == 7:
+                rich_presence_menu()
+            elif choice == 8:
+                configure_colors_menu()
+            
+            # Opções que PRECISAM de seleção de token
+            elif choice in [2, 3, 4, 6, 9, 10]:
+                token_data = select_token()
+                if token_data:
+                    GLOBAL_RP_TOKEN_DATA = token_data # Define o token ativo para o RP
+                    if choice == 2:
+                        global GLOBAL_DELETED_COUNT
+                        GLOBAL_DELETED_COUNT = 0
+                        cleanup_menu(token_data)
+                    elif choice == 3:
+                        mass_dm_menu(token_data)
+                    elif choice == 4:
+                        backup_messages_html_menu(token_data)
+                    elif choice == 6:
+                        leave_servers_menu(token_data)
+                    elif choice == 9:
+                        manage_profile_aesthetics(token_data)
+                    elif choice == 10:
+                        kosame_farm_menu(token_data) # NOVA FUNÇÃO DE FARM
+                    GLOBAL_RP_TOKEN_DATA = None # Limpa após a conclusão
+
+            elif choice == 0:
+                print(f"\n{YELLOW}[*]{RESET} Desconectando Rich Presence...")
+                stop_rich_presence()
+                print(f"\n{YELLOW}[*]{RESET} Saindo do Draktharr...")
+                time.sleep(1)
+                break
+            else:
+                print(f"{RED}[✗]{RESET} Opção inválida.")
+                safe_input(f"\n{CYAN}Pressione ENTER para continuar...{RESET}")
+
+        except Exception as e:
+            print(f"\n{RED}{'═' * 62}{RESET}")
+            print(f"{RED}[ERRO FATAL NA EXECUÇÃO]{RESET} O script parou ao executar esta opção: {e}")
+            print(f"{RED}{'═' * 62}{RESET}")
+            safe_input(f"\n{CYAN}Pressione ENTER para voltar ao Menu Principal...{RESET}")
+
+if __name__ == '__main__':
+    try:
+        main_menu()
+    except KeyboardInterrupt:
+        print(f"\n{RED}[!] Interrupção pelo usuário. Saindo...{RESET}")
+        stop_rich_presence()
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n{RED}[!] Erro de inicialização. Saindo...{e}{RESET}")
+        stop_rich_presence()
+        sys.exit(1)
